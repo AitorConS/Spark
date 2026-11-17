@@ -103,6 +103,9 @@ int slirp_backend_open(const struct hvf_options *options,net_receive_fn receive)
     hvf_policy_set(options->security);
     // The guest is configured with the same MTU by whoever wrote the config.
     size_t mtu=options->mtu?options->mtu:1500;
+    // The same bounds lib.rs enforces (MAX_SLIRP_MTU): libslirp's fixed-size
+    // replies (bootp) assume at least an IPv4 minimum link.
+    if(mtu<576||mtu>9000)return -1;
     SlirpConfig c={.version=6,.in_enabled=true,.if_mtu=mtu,.if_mru=mtu,.disable_host_loopback=false};
     c.disable_dns=!(options->security && (options->security->development || options->security->dns_port));
     inet_pton(AF_INET,"10.0.2.0",&c.vnetwork);inet_pton(AF_INET,"255.255.255.0",&c.vnetmask);

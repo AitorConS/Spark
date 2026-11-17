@@ -285,6 +285,11 @@ impl Watchdog {
             }
         }
     }
+    /// Whether `pid` is a process of the VM as last recorded. Telemetry from
+    /// the VMM (such as the broker PID it reports) is checked against this.
+    pub fn is_member(&self, pid: u32) -> bool {
+        self.members.iter().any(|m| m.pid == pid as i32)
+    }
     // The supervisor holds an unreaped group leader Child while calling this.
     // Kernel enumeration finds broker and authority; telemetry is untrusted.
     pub fn poll(&mut self, leader: u32) -> Option<String> {

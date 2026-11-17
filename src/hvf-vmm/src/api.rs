@@ -351,7 +351,11 @@ fn serve_inner(socket: &Path, initial: Option<Config>, headless: bool) -> Result
                 ("GET", "/metrics") => {
                     let mut sample = metrics.sample(
                         child.as_ref().map(|p| p.id()),
-                        child.as_ref().and_then(|p| p.4.broker_pid()),
+                        // The VMM reports the broker PID; describe it only if
+                        // it is a process of this VM, never another one.
+                        child
+                            .as_ref()
+                            .and_then(|p| p.4.broker_pid().filter(|pid| p.5.is_member(*pid))),
                         transport.connections(),
                         transport.rejected,
                     );
