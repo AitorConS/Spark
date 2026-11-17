@@ -180,25 +180,69 @@ pub(crate) fn members(
     }
     Some(found)
 }
+/// Where a kill stops looking: far more processes than a host allows a user.
+const MAX_SWEEP: usize = 1 << 16;
+/// Calls `signal` for every process of the VM other than the leader, as the
+/// walk reaches it. Unlike `members` it has no use for a complete answer, so
+/// nothing makes it give up: a VM with more than MAX_MEMBERS processes, or a
+/// listing that fails, still has every process the walk does reach signalled.
+/// A process's children are listed before it is signalled, while it is still
+/// their parent, and a known member is signalled only if it is still the
+/// process recorded, never a reused PID.
+pub(crate) fn sweep(
+    table: &impl Processes,
+    leader: i32,
+    known: &std::collections::BTreeSet<Member>,
+    mut signal: impl FnMut(i32),
+) {
+    let mut queue = table.group(leader).unwrap_or_default();
+    queue.push(leader);
+    queue.extend(
+        known
+            .iter()
+            .filter(|m| table.start(m.pid) == Some(m.start))
+            .map(|m| m.pid),
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(pid) = queue.pop() {
+        if pid <= 0 || !seen.insert(pid) {
+            continue;
+        }
+        if seen.len() > MAX_SWEEP {
+            return;
+        }
+        queue.extend(table.children(pid).unwrap_or_default());
+        if pid != leader && table.start(pid).is_some() {
+            signal(pid);
+        }
+    }
+}
 /// The host's process table, through libproc.
 pub(crate) struct Darwin;
 impl Darwin {
     fn list(kind: u32, argument: i32) -> Option<Vec<i32>> {
-        let mut pids = [0i32; MAX_MEMBERS];
-        let size = std::mem::size_of_val(&pids) as i32;
-        // SAFETY: writable buffer of `size` bytes; libproc fills at most that.
-        let n =
-            unsafe { libc::proc_listpids(kind, argument as u32, pids.as_mut_ptr().cast(), size) };
-        if n < 0 || n >= size || n % 4 != 0 {
-            return None;
+        // A listing that fills the buffer may be cut short: ask again with
+        // more room, so that a parent with many children is listed whole.
+        let mut pids = vec![0i32; MAX_MEMBERS];
+        loop {
+            let size = i32::try_from(std::mem::size_of_val(pids.as_slice())).ok()?;
+            // SAFETY: writable buffer of `size` bytes; libproc fills at most that.
+            let n = unsafe {
+                libc::proc_listpids(kind, argument as u32, pids.as_mut_ptr().cast(), size)
+            };
+            if n < 0 || n > size || n % 4 != 0 {
+                return None;
+            }
+            if n < size {
+                pids.truncate(n as usize / 4);
+                pids.retain(|&p| p > 0);
+                return Some(pids);
+            }
+            if pids.len() >= MAX_SWEEP {
+                return None;
+            }
+            pids = vec![0i32; pids.len() * 4];
         }
-        Some(
-            pids[..n as usize / 4]
-                .iter()
-                .copied()
-                .filter(|&p| p > 0)
-                .collect(),
-        )
     }
 }
 impl Processes for Darwin {
@@ -273,17 +317,16 @@ impl Watchdog {
             None => false,
         }
     }
-    /// SIGKILL to every recorded process of the VM other than the leader,
-    /// including any that left its process group. Each is checked against its
-    /// start time first, so a reused PID is never signalled.
+    /// SIGKILL to every process of the VM other than the leader, including
+    /// any that left its process group, however many there are: see `sweep`.
+    /// A recorded member is checked against its start time first, so a reused
+    /// PID is never signalled.
     pub fn kill_members(&mut self, leader: u32) {
-        self.track(leader);
-        for member in &self.members {
-            if member.pid != leader as i32 && Darwin.start(member.pid) == Some(member.start) {
-                // SAFETY: plain signal to a process verified to be the recorded one.
-                unsafe { libc::kill(member.pid, libc::SIGKILL) };
-            }
-        }
+        sweep(&Darwin, leader as i32, &self.members, |pid| {
+            // SAFETY: plain signal to a process the walk just found to be the
+            // VM's: in its group, a descendant, or the recorded member.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        });
     }
     /// Whether `pid` is a process of the VM as last recorded. Telemetry from
     /// the VMM (such as the broker PID it reports) is checked against this.
@@ -450,6 +493,57 @@ mod tests {
         assert!(members(&table, 10, &Default::default()).is_none());
     }
 
+    #[test]
+    fn sweep_signals_past_the_member_limit() {
+        // The leader, a broker that left the group, and more children of the
+        // broker (in a group of their own) than `members` accepts.
+        let count = 3 * MAX_MEMBERS as i32;
+        let mut table = Table([(10, (1, 10, 1)), (11, (10, 11, 2)), (99, (1, 99, 3))].into());
+        table.0.extend((100..100 + count).map(|p| (p, (11, 11, 4))));
+        let known = Default::default();
+        assert!(members(&table, 10, &known).is_none());
+        let mut signalled = Vec::new();
+        sweep(&table, 10, &known, |pid| signalled.push(pid));
+        signalled.sort_unstable();
+        let expected: Vec<i32> = std::iter::once(11).chain(100..100 + count).collect();
+        assert_eq!(signalled, expected);
+    }
+    #[test]
+    fn sweep_signals_recorded_members_but_not_reused_pids() {
+        // 11 was recorded, then reparented outside the group; 12 was recorded
+        // and its PID now belongs to another process.
+        let table = Table([(10, (1, 10, 1)), (11, (1, 11, 2)), (12, (1, 12, 9))].into());
+        let known = [
+            Member { pid: 11, start: (2, 0) },
+            Member { pid: 12, start: (3, 0) },
+        ]
+        .into();
+        let mut signalled = Vec::new();
+        sweep(&table, 10, &known, |pid| signalled.push(pid));
+        assert_eq!(signalled, [11]);
+    }
+    #[test]
+    fn darwin_lists_more_children_than_the_member_limit() {
+        // Real processes: this test's own children, more than one buffer.
+        let count = MAX_MEMBERS + 6;
+        let mut children: Vec<_> = (0..count)
+            .map(|_| {
+                std::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let listed = Darwin.children(std::process::id() as i32);
+        for child in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let listed = listed.unwrap();
+        for child in &children {
+            assert!(listed.contains(&(child.id() as i32)));
+        }
+    }
     #[test]
     fn default_disk_budget_is_above_benchmark_scale() {
         let limits = Limits::default();
