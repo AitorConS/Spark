@@ -137,6 +137,30 @@ static void answer_switch(void){
     memcpy(f+14,"JRBC",4);f[18]=1;f[19]=SWITCH_CAPS_LARGE;
     if(net_backend_send(f,sizeof(f)))switch_caps.answer=0;
 }
+// A TSO frame for a guest without TSO needs one RX chain per segment, and its
+// sender chooses that count (up to GSO_MAX_SEGMENTS). Waiting for chains is
+// therefore bounded: a frame that needs more chains than the ring can hold is
+// dropped at once, and one still refused after RX_SEGMENT_WAIT_MS is dropped,
+// so no frame retained for segmentation stops delivery from other sources.
+#define RX_SEGMENT_WAIT_MS 100
+static uint64_t segment_since,segment_last;
+static uint64_t rx_now_ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000+(uint64_t)t.tv_nsec/1000000;}
+// Chains of the head's length the ring could ever offer at once.
+static unsigned rx_capacity(struct queue *q){
+    uint16_t i=head(q);unsigned n=0;
+    for(;;){
+        if(++n>QSZ)die("RX cycle");struct desc d=desc(q,i);
+        if(!(d.flags&1))break;i=d.next;
+    }
+    return QSZ/n;
+}
+// Called on each refusal; a gap of a whole window means a new wait.
+static int segment_wait_expired(void){
+    uint64_t now=rx_now_ms();
+    if(!segment_since||now-segment_last>=RX_SEGMENT_WAIT_MS)segment_since=now;
+    segment_last=now;
+    return now-segment_since>=RX_SEGMENT_WAIT_MS;
+}
 // opaque is the frame's virtio_net_hdr when it came from a direct peer
 // (another guest: malformed offloads are dropped, never fatal); NULL for
 // the switch, whose frames have complete checksums except the whole TSO
@@ -171,9 +195,12 @@ static ssize_t receive(const void *buf,size_t len,void *opaque){
         // A guest without TSO receives the segments it would have seen on a wire.
         int count=vnet_gso_count(buf,len,&hd);
         if(queued(q)<(unsigned)count){
-            if(quiescing){drop_packets++;drop_bytes+=len;return (ssize_t)len;}
+            if(quiescing||(unsigned)count>rx_capacity(q)||segment_wait_expired()){
+                segment_since=0;drop_packets++;drop_bytes+=len;return (ssize_t)len;
+            }
             errno=EAGAIN;return -1;
         }
+        segment_since=0;
         if(!budget_take(&network_budget,len,(unsigned)count)){errno=EAGAIN;return -1;}
         for(int s=0;s<count;s++){
             long n=vnet_gso_segment(buf,len,&hd,(unsigned)s,staging,sizeof(staging));
@@ -245,7 +272,7 @@ static void transmit(void){
 int net_init(void *memory,size_t size,const struct hvf_options *options){
     budget_init(&network_budget,options->network_bytes_per_second,options->network_packets_per_second,256ULL<<10,256);
     memset(cfg,0,sizeof(cfg));memset(queues,0,sizeof(queues));
-    status=isr=features=selectq=rx=tx=0;quiescing=0;bar=BAR;tx_resume=0;memset(&switch_caps,0,sizeof(switch_caps));
+    status=isr=features=selectq=rx=tx=0;quiescing=0;segment_since=segment_last=0;bar=BAR;tx_resume=0;memset(&switch_caps,0,sizeof(switch_caps));
     rx_bytes=tx_bytes=drop_packets=drop_bytes=0;
     ram=memory;ram_size=size;enabled=options->network_enabled;if(!enabled)return 0;
     memcpy(mac,options->mac,6);

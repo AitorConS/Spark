@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define BASE 0x40000000ULL
 #define BAR 0x10010000ULL
@@ -263,6 +264,45 @@ static void test_rx_oversized(void){
     assert(receive(frame,60,NULL)==60);
     assert(*used_idx(RX_RING)==1&&*used_len(RX_RING,0)==70);
 }
+// A TSO frame from another guest, for a guest without TSO, needs one RX chain
+// per segment and its sender picks the count. One that can never fit in the
+// ring is dropped at once; one that could is retained only for a bounded time.
+// Either way frames behind it are delivered again.
+static void post_rx_chains(unsigned count){
+    struct descriptor *d=(void *)(memory+RX_RING);
+    for(unsigned k=0;k<count;k++){
+        unsigned slot=rx_slot;rx_slot+=2; // a header and a data descriptor, as legacy drivers post
+        d[slot]=(struct descriptor){BASE+RX_BUF+slot*2048,10,3,(uint16_t)(slot+1)};
+        d[slot+1]=(struct descriptor){BASE+RX_BUF+(slot+1)*2048,2048,2,0};
+        avail(RX_RING)[2+(avail(RX_RING)[1]%256)]=(uint16_t)slot;avail(RX_RING)[1]++;
+    }
+}
+static void test_rx_segment_bound(void){
+    static uint8_t packet[65536];uint64_t metrics[6];
+    setup(0x20);reset_slots();
+    post_rx_chains(100); // at most 128 two-descriptor chains fit in the ring
+    net_metrics(metrics);uint64_t drops=metrics[4];
+    // gso_size 1: 200 segments can never fit, so the frame is dropped, not retained.
+    size_t len=tso_packet(packet,200,1);
+    assert(receive(packet+10,len-10,packet)==(ssize_t)(len-10));
+    net_metrics(metrics);assert(metrics[4]==drops+1&&*used_idx(RX_RING)==0);
+    // 120 segments could fit once the guest posts more chains: backpressure,
+    // but only for a bounded time.
+    len=tso_packet(packet,120,1);
+    errno=0;assert(receive(packet+10,len-10,packet)<0&&errno==EAGAIN);
+    ssize_t result=-1;
+    for(int i=0;i<300&&result<0;i++){usleep(1000);result=receive(packet+10,len-10,packet);}
+    assert(result==(ssize_t)(len-10));
+    net_metrics(metrics);assert(metrics[4]==drops+2&&*used_idx(RX_RING)==0);
+    // The next frame is delivered, and a later wait starts a fresh window.
+    uint8_t plain[60]={0};
+    assert(receive(plain,sizeof(plain),NULL)==sizeof(plain)&&*used_idx(RX_RING)==1);
+    usleep(150000);
+    errno=0;assert(receive(packet+10,len-10,packet)<0&&errno==EAGAIN);
+    post_rx_chains(27); // 126 chains now queued
+    assert(receive(packet+10,len-10,packet)==(ssize_t)(len-10)&&*used_idx(RX_RING)==121);
+    net_metrics(metrics);assert(metrics[4]==drops+2);
+}
 int main(void){
     memory=calloc(1,SIZE);assert(memory);
     struct hvf_options options={.network_enabled=1};
@@ -271,6 +311,7 @@ int main(void){
     test_tx_resume_bound_to_frame();
     test_rx_from_peer();
     test_rx_oversized();
+    test_rx_segment_bound();
     test_switch_capabilities();
     net_close();free(memory);
     puts("net-offload: ok");
