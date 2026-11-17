@@ -18,6 +18,8 @@ Local final campaign (2026-09-11): 4,912,942 cases in 61 s, exit code 0, with no
 
 `sh experiments/hvf/fuzz/run-slirp.sh` builds libslirp 4.9.4 and the adapters with ASan/UBSan/libFuzzer. It uses the same mandatory socket-policy inclusions as the product, with no authorized egress/DNS/listeners. Each input creates, processes and destroys a stack; the local GLib is still not instrumented. This target does not replace IPC authority fuzzing or testing with active permissions.
 
+An input is one Ethernet frame at the default 1500-byte MTU (the original format, which the corpus files from before keep), or, after the magic `HVFS`, a big-endian 16-bit MTU selector (1500, 576, 4000 or 9000) and up to 256 frames, each preceded by its big-endian 16-bit length. Several frames per input reach state a single frame cannot (IPv4 reassembly, TCP), and the selector the jumbo links. Every frame libslirp hands the guest must fit the link's MTU: a larger one aborts the run.
+
 First campaign: 2,502,154 inputs in 61 seconds with no sanitizer reports; evidence in `build/slirp-fuzz.log`. The device campaign after copying and validating full strings ran 4,798,923 inputs/61 s (`build/resources-fuzz.log`).
 
 ## Implementation closure and snapshots
