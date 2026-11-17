@@ -212,6 +212,7 @@ impl Endpoint {
                         };
 
                         // We found a potential request, let's parse it.
+                        let body = declares_body(&b[..end]);
                         let response = parse_request_bytes(&b[..end], callback);
 
                         // The unwrap is safe because a Vec will allocate more space until all the
@@ -224,12 +225,22 @@ impl Endpoint {
                         // We have to remove the bytes up to end from receive_buf, by shifting the
                         // others to the beginning of the buffer, and updating receive_buf_left.
                         // Also, advance the rwnd edge of the inner connection.
-                        b.copy_within(end.., 0);
-                        self.receive_buf_left -= end;
+                        // A request that declares a body is never served whole: requests
+                        // are framed by the blank line alone, so its body would otherwise
+                        // be parsed as a separate request without the headers (such as
+                        // X-Forwarded-For) its sender framed it with. Answer it, drop
+                        // everything after it and close the connection.
+                        let consumed = if body { self.receive_buf_left } else { end };
+                        b.copy_within(consumed.., 0);
+                        self.receive_buf_left -= consumed;
                         // Safe to unwrap because we assert that the response buffer is small
                         // enough.
                         self.connection
-                            .advance_local_rwnd_edge(u32::try_from(end).unwrap());
+                            .advance_local_rwnd_edge(u32::try_from(consumed).unwrap());
+                        if body {
+                            self.stop_receiving = true;
+                            self.connection.close();
+                        }
                         break;
                     }
                 }
@@ -320,6 +331,19 @@ fn build_response(status_code: StatusCode, body: Body) -> Response {
 }
 
 /// Parses the request bytes and builds a `micro_http::Response` by the given callback function.
+/// Whether a request's header block announces a body (`Content-Length` other than 0, or
+/// `Transfer-Encoding`). MMDS requests never carry one.
+fn declares_body(headers: &[u8]) -> bool {
+    headers.split(|&c| c == b'\n').skip(1).any(|line| {
+        let Some(colon) = line.iter().position(|&c| c == b':') else {
+            return false;
+        };
+        let (name, value) = (line[..colon].trim_ascii(), line[colon + 1..].trim_ascii());
+        name.eq_ignore_ascii_case(b"transfer-encoding")
+            || (name.eq_ignore_ascii_case(b"content-length") && value.iter().any(|&c| c != b'0'))
+    })
+}
+
 fn parse_request_bytes<F: FnOnce(Request) -> Response>(
     byte_stream: &[u8],
     callback: F,
@@ -368,6 +392,68 @@ mod tests {
         pub fn set_eviction_threshold(&mut self, value: u64) {
             self.eviction_threshold = value;
         }
+    }
+
+    #[test]
+    fn test_declares_body() {
+        assert!(!declares_body(b"GET / HTTP/1.1\r\n\r\n"));
+        assert!(!declares_body(
+            b"PUT / HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
+        ));
+        assert!(declares_body(
+            b"PUT / HTTP/1.1\r\ncontent-length:  12\r\n\r\n"
+        ));
+        assert!(declares_body(
+            b"PUT / HTTP/1.1\nTransfer-Encoding: chunked\n\n"
+        ));
+        // The request line is not a header.
+        assert!(!declares_body(b"GET /Content-Length:1 HTTP/1.1\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_body_is_not_served_as_a_request() {
+        let mut buf1 = [0u8; 500];
+        let mut buf2 = [0u8; 500];
+        let mut write_buf = [0u8; RCV_BUF_MAX_SIZE as usize + 100];
+        let t = ConnectionTester::new();
+        let mut syn = t.write_syn(buf1.as_mut());
+        syn.set_flags_after_ns(TcpFlags::SYN);
+        let remote_isn = syn.sequence_number();
+        let mut endpoint = Endpoint::new_with_defaults(&syn).unwrap();
+        let endpoint_isn = endpoint
+            .write_next_segment(write_buf.as_mut(), t.mss_reserved)
+            .unwrap()
+            .inner()
+            .sequence_number();
+        let mut ctrl = t.write_ctrl(buf2.as_mut());
+        ctrl.set_flags_after_ns(TcpFlags::ACK);
+        ctrl.set_ack_number(endpoint_isn.wrapping_add(1));
+        endpoint.receive_segment(&ctrl, mock_callback);
+        assert!(endpoint.connection.is_established());
+
+        // One message, as a proxy that adds X-Forwarded-For frames it: the body is
+        // itself a token request without that header.
+        let inner = b"PUT http://169.254.169.254/latest/api/token HTTP/1.1\r\n\
+                      X-metadata-token-ttl-seconds: 60\r\n\r\n";
+        let mut message = format!(
+            "PUT http://169.254.169.254/latest/api/token HTTP/1.1\r\nX-Forwarded-For: \
+             203.0.113.7\r\nContent-Length: {}\r\n\r\n",
+            inner.len()
+        )
+        .into_bytes();
+        message.extend_from_slice(inner);
+        {
+            let mut data = t.write_data(write_buf.as_mut(), &message);
+            data.set_flags_after_ns(TcpFlags::ACK);
+            data.set_sequence_number(remote_isn.wrapping_add(1));
+            data.set_ack_number(endpoint_isn.wrapping_add(1));
+            endpoint.receive_segment(&data, mock_callback);
+        }
+        // One response; the body is not kept to be parsed later, and nothing more is read.
+        let response = from_utf8(&endpoint.response_buf).unwrap();
+        assert_eq!(response.matches("HTTP/1.1 ").count(), 1, "{response}");
+        assert_eq!(endpoint.receive_buf_left, 0);
+        assert!(endpoint.stop_receiving);
     }
 
     #[test]
