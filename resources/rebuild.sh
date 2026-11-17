@@ -19,17 +19,33 @@ function install_dependencies {
     apt update
     apt install -y bc flex bison gcc make libelf-dev libssl-dev squashfs-tools busybox-static tree cpio curl patch docker.io dwarves
 
-    # Install Go
-    version=$(curl -s https://go.dev/VERSION?m=text | head -n 1)
+    install_go
+}
+
+# Install a pinned Go toolchain. It runs as root and builds binaries for the
+# CI guest rootfs, so it is fetched over HTTPS only and its SHA-256 (from
+# https://go.dev/dl/?mode=json) is checked before anything is extracted.
+# To update: change GO_VERSION and both digests together.
+GO_VERSION=go1.27.4
+GO_SHA256_AMD64=7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
+GO_SHA256_ARM64=3392582988a273a87ab5043ee1b2c9c17a2c3c00580bf9326c47a2e0aaaeac92
+function install_go {
+    local dest=${1:-/usr/local} archive sha256
     case $ARCH in
-        x86_64) archive="${version}.linux-amd64.tar.gz" ;;
-        aarch64) archive="${version}.linux-arm64.tar.gz" ;;
+        x86_64) archive="${GO_VERSION}.linux-amd64.tar.gz"; sha256=$GO_SHA256_AMD64 ;;
+        aarch64) archive="${GO_VERSION}.linux-arm64.tar.gz"; sha256=$GO_SHA256_ARM64 ;;
+        *) echo "unsupported architecture for Go: $ARCH" >&2; return 1 ;;
     esac
-    curl -LO http://go.dev/dl/${archive}
-    tar -C /usr/local -xzf $archive
-    export PATH=/usr/local/go/bin:$PATH
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSLo "$archive" "https://go.dev/dl/${archive}"
+    if ! echo "${sha256}  ${archive}" | sha256sum -c --strict -; then
+        rm -f "$archive"
+        echo "Go archive digest mismatch; refusing to install" >&2
+        return 1
+    fi
+    tar -C "$dest" -xzf "$archive"
+    rm "$archive"
+    export PATH=$dest/go/bin:$PATH
     go version
-    rm $archive
 }
 
 function compile_and_install {
