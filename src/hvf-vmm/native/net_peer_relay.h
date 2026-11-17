@@ -22,6 +22,11 @@ static struct {
     // PEER_ADD descriptors stay referenced here until the VMM acknowledges them.
     struct {uint64_t id;int fd;} held[RELAY_HELD];
     unsigned nheld;
+    // A PEER_RESET the VMM has not received yet. The channel is a bounded
+    // datagram socket the VMM does not drain while paused, so a withdrawal
+    // can fail to fit: the broker then ends the switch session and neither
+    // reconnects nor relays anything until this RESET is delivered.
+    int reset_owed;
 } relay={.ctl=-1,.channel=-1,.pending_fd=-1};
 static uint64_t relay_ms(void){
     struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);
@@ -46,7 +51,8 @@ static void relay_disconnect(void){
     for(unsigned i=0;i<relay.nheld;i++)close(relay.held[i].fd);
     relay.ctl=relay.pending_fd=-1;relay.connecting=0;relay.used=0;relay.nheld=0;relay.retry=relay_ms()+1000;
     // Fail closed: without the switch, no peer may stay authorized.
-    if(had)(void)relay_to_vmm(&(struct peer_message){.type=PEER_RESET},-1);
+    if(had)relay.reset_owed=1;
+    if(relay.reset_owed&&!relay_to_vmm(&(struct peer_message){.type=PEER_RESET},-1))relay.reset_owed=0;
 }
 // A short message on a Unix stream either fits or the connection is unusable.
 static int relay_to_switch(const struct peer_message *m){
@@ -108,7 +114,9 @@ static void relay_from_switch(void){
             if(fd>=0)close(fd);
             relay_disconnect();return;
         }
-        if(m.type!=PEER_ADD){(void)relay_to_vmm(&m,-1);continue;}
+        // A WELCOME or PEER_DEL that does not reach the VMM would leave a
+        // withdrawn peer authorized: end the session instead (fail closed).
+        if(m.type!=PEER_ADD){if(relay_to_vmm(&m,-1)){relay_disconnect();return;}continue;}
         if(relay.nheld==RELAY_HELD||relay_to_vmm(&m,fd)){
             close(fd);
             if(relay_to_switch(&(struct peer_message){.type=PEER_ACK,.epoch=m.epoch,.value=m.value}))return;
@@ -138,6 +146,10 @@ static unsigned relay_poll_fds(struct pollfd *fds){
 }
 static void relay_service(void){
     if(relay.channel<0)return;
+    if(relay.reset_owed){
+        if(relay_to_vmm(&(struct peer_message){.type=PEER_RESET},-1)){relay_from_vmm();return;}
+        relay.reset_owed=0;
+    }
     relay_connect();
     if(relay.ctl>=0&&relay.connecting){
         struct pollfd p={relay.ctl,POLLOUT,0};

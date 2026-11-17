@@ -256,6 +256,37 @@ static void test_relay(void){
     assert(read_message(sw,&m)<0&&m.type==PEER_HELLO);
     close(sw);usleep(10000);relay_service();
     assert(relay.ctl<0&&read_message(channel[1],&m)<0&&m.type==PEER_RESET);
+
+    // A channel the VMM does not drain (it is paused) must never lose a
+    // withdrawal: the broker fails closed, ends the switch session, and owes
+    // the VMM a RESET, relaying nothing else, until the RESET is delivered.
+    relay.retry=0;relay_service();
+    for(int i=0;i<100&&relay.connecting;i++){relay_service();usleep(1000);}
+    sw=accept(listener,NULL,NULL);assert(sw>=0);set_timeout(sw);
+    assert(read_message(sw,&m)<0&&m.type==PEER_HELLO);
+    struct peer_message del={.type=PEER_DEL,.epoch=3,.value=99};
+    for(int i=0;i<4096&&relay.ctl>=0;i++){send_message(sw,&del,-1);usleep(100);relay_service();}
+    assert(relay.ctl<0&&relay.reset_owed);
+    char byte2;assert(recv(sw,&byte2,1,0)==0); // the switch sees the session end
+    close(sw);
+    relay.retry=0;relay_service();assert(relay.ctl<0&&!relay.connecting); // no new session yet
+    unsigned dels=0;int reset=0;
+    for(int round=0;round<100&&!reset;round++){
+        uint8_t wire[PEER_MESSAGE];
+        while(recv(channel[1],wire,sizeof(wire),MSG_DONTWAIT)==(ssize_t)sizeof(wire)){
+            assert(!peer_decode(wire,&m)&&!reset);
+            if(m.type==PEER_RESET)reset=1;else{assert(m.type==PEER_DEL);dels++;}
+        }
+        relay_service();
+    }
+    assert(reset&&dels>0&&!relay.reset_owed);
+    // Then the broker reconnects as usual.
+    relay.retry=0;relay_service();
+    for(int i=0;i<100&&relay.connecting;i++){relay_service();usleep(1000);}
+    sw=accept(listener,NULL,NULL);assert(sw>=0);set_timeout(sw);
+    assert(read_message(sw,&m)<0&&m.type==PEER_HELLO);
+    close(sw);usleep(10000);relay_service();
+    assert(relay.ctl<0&&read_message(channel[1],&m)<0&&m.type==PEER_RESET);
     close(listener);unlink(path);rmdir(directory);close(channel[0]);close(channel[1]);
 }
 // A peer that frees one datagram slot at a time must not re-arm the stall
