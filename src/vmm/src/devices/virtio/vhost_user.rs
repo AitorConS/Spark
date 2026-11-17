@@ -189,7 +189,9 @@ impl VhostUserHandleBackend for Frontend {
     /// Set the memory map regions on the slave so it can translate the vring
     /// addresses. In the ancillary data there is an array of file descriptors
     fn set_mem_table(&self, regions: &[VhostUserMemoryRegionInfo]) -> Result<(), vhost::Error> {
-        <Frontend as VhostBackend>::set_mem_table(self, regions)
+        // vhost 0.18 returns the backend's mapping bases, which a backend sends
+        // only while postcopy is listening; Firecracker does not use postcopy.
+        <Frontend as VhostBackend>::set_mem_table(self, regions).map(|_| ())
     }
 
     /// Set the size of the queue.
