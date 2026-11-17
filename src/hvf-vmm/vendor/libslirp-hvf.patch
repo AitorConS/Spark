@@ -270,3 +270,25 @@
      if (have_valid_socket(so->s)) {
          if (slirp_bind_outbound(so, af) != 0) {
              // bind failed - close socket
+--- a/src/ip_icmp.c
++++ b/src/ip_icmp.c
+@@ -202,6 +202,10 @@
+     DEBUG_ARG("icmp_type = %d", icp->icmp_type);
+     switch (icp->icmp_type) {
+     case ICMP_ECHO:
++        /* A reassembled echo whose length no longer fits ip_len would wrap
++         * and then skip fragmentation on output: drop it. */
++        if (ip->ip_len > IP_MAXPACKET - hlen)
++            goto freeit;
+         ip->ip_len += hlen; /* since ip_input subtracts this */
+         if (ip->ip_dst.s_addr == slirp->vhost_addr.s_addr ||
+             ip->ip_dst.s_addr == slirp->vnameserver_addr.s_addr) {
+@@ -341,7 +345,7 @@
+         goto end_error; /* Only reply to fragment 0 */
+ 
+     /* Do not reply to source-only IPs */
+-    if ((ip->ip_src.s_addr & htonl(~(0xf << 28))) == 0) {
++    if ((ip->ip_src.s_addr & htonl(~(0xfu << 28))) == 0) {
+         goto end_error;
+     }
+ 

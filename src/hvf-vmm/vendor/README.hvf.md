@@ -11,6 +11,9 @@ a UBSan finding reproduced by the final campaign's fragment corpus.
 It validates the declared and available length of NC-SI packets before reading
 OEM payloads, including Mellanox-specific fields. The permanent corpus
 `ncsi-oem-truncated-payload` reproduces the original out-of-bounds read.
+It drops an ICMP echo whose reassembled length would wrap the 16-bit `ip_len`
+once the header is added back, which made the reply skip fragmentation, and
+writes `0xfu << 28` where upstream shifts a signed int into the sign bit.
 `libslirp-version.h` is derived from the upstream template with the version pinned
 in `libslirp.json` and is checked into Git so that direct builds do not depend
 on a prior Meson configuration. When updating libslirp, also update
