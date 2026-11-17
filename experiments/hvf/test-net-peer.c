@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 static const uint8_t self_mac[6]={2,0,0,0,0,1},self_ip[4]={10,0,0,1};
@@ -257,6 +258,44 @@ static void test_relay(void){
     assert(relay.ctl<0&&read_message(channel[1],&m)<0&&m.type==PEER_RESET);
     close(listener);unlink(path);rmdir(directory);close(channel[0]);close(channel[1]);
 }
+// A peer that frees one datagram slot at a time must not re-arm the stall
+// bound with each send that fits: the time net_peer_send keeps the TX head
+// (returns 0) is bounded overall, not per refusal episode.
+static uint64_t test_ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000+(uint64_t)t.tv_nsec/1000000;}
+static void test_trickle_stall(void){
+    int channel[2],link[2];
+    assert(!socketpair(AF_UNIX,SOCK_DGRAM,0,channel)&&!socketpair(AF_UNIX,SOCK_DGRAM,0,link));
+    set_timeout(channel[1]);size_link(link[1]);
+    net_peer_open(channel[0],self_mac,deliver);
+    struct peer_message welcome={.type=PEER_WELCOME,.epoch=13};memcpy(welcome.mac,self_mac,6);memcpy(welcome.ip,self_ip,4);
+    struct peer_message add={.type=PEER_ADD,.epoch=13,.value=4};memcpy(add.mac,peer_mac,6);memcpy(add.ip,peer_ip,4);
+    send_message(channel[1],&welcome,-1);send_message(channel[1],&add,link[0]);close(link[0]);
+    net_peer_poll();
+    struct peer_message m;assert(read_message(channel[1],&m)<0&&m.type==PEER_ACK&&m.flags==1);
+    static uint8_t f[9010],got[65536];size_t size=vipv4(f,peer_mac,self_mac,self_ip,9000);
+    while(net_peer_send(f,size)==1){}
+    // The peer reads one datagram every 20 ms; the sender offers two frames each time.
+    uint64_t start=test_ms(),retained=0,last=start;int last_zero=1;
+    while(test_ms()-start<800){
+        usleep(20000);
+        (void)recv(link[1],got,sizeof(got),MSG_DONTWAIT);
+        for(int i=0;i<2;i++){
+            uint64_t now=test_ms();
+            if(last_zero)retained+=now-last;
+            last=now;last_zero=net_peer_send(f,size)==0;
+        }
+    }
+    // Before the bound was cumulative the head stayed retained for the whole 800 ms.
+    if(retained>=300){fprintf(stderr,"trickling peer retained the TX head for %llu ms\n",(unsigned long long)retained);abort();}
+    uint64_t metrics[7];net_peer_metrics(metrics);assert(metrics[5]>0);
+    // A link that has drained and taken frames for a whole window applies backpressure again.
+    while(recv(link[1],got,sizeof(got),MSG_DONTWAIT)>0){}
+    usleep(150000);
+    assert(net_peer_send(f,size)==1);
+    while(net_peer_send(f,size)==1){}
+    while(recv(link[1],got,sizeof(got),MSG_DONTWAIT)>0){}
+    net_peer_close();close(channel[1]);close(link[1]);
+}
 // Built with PEER_IDLE_MS=400: a quiet link is reported idle exactly once,
 // and traffic makes it active again.
 static void test_idle(void){
@@ -323,6 +362,7 @@ int main(void){
     test_data_plane();
     test_relay();
     test_idle();
+    test_trickle_stall();
     test_sandboxed_vmm();
     puts("net-peer: ok");
     return 0;

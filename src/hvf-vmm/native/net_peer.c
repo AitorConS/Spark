@@ -15,6 +15,9 @@
 #define PEER_RX_BUDGET 64
 // A peer that cannot take frames for this long is a stalled link: drop its
 // frames, as the switch's bounded writer does, so it never blocks the TX ring.
+// The bound is cumulative: a link leaves the stalled state only after it has
+// taken frames with no refusal for a whole window, so a peer that frees one
+// slot at a time cannot re-arm it and hold the TX head indefinitely.
 #define PEER_STALL_MS 100
 #define PEER_STATS_MS 1000
 // A link without frames either way for this long is reported idle once, so
@@ -24,7 +27,7 @@
 #endif
 struct peer {
     uint64_t id;int fd,dead;uint8_t mac[6],ip[4];
-    uint64_t blocked,active;size_t deferred;uint8_t *buf;int idle;
+    uint64_t blocked,refused,active;size_t deferred;uint8_t *buf;int idle;
 };
 static struct peer peers[PEER_MAX];
 static unsigned npeers,next_rx;
@@ -141,10 +144,15 @@ int net_peer_send(const uint8_t *vnet_frame,size_t total){
     // Frames the switch would reject go to the switch, which drops and counts them.
     if(!p||!net_frame_source_valid(f,len,self_mac,self_ip))return -1;
     ssize_t n=send(p->fd,vnet_frame,total,MSG_DONTWAIT);
-    if(n==(ssize_t)total){p->blocked=0;p->active=now_ms();p->idle=0;tx_frames++;tx_bytes+=len;return 1;}
+    if(n==(ssize_t)total){
+        uint64_t now=now_ms();
+        if(p->blocked&&now-p->refused>=PEER_STALL_MS)p->blocked=0;
+        p->active=now;p->idle=0;tx_frames++;tx_bytes+=len;return 1;
+    }
     if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==ENOBUFS)){
         uint64_t now=now_ms();
         if(!p->blocked)p->blocked=now;
+        p->refused=now;
         if(now-p->blocked<PEER_STALL_MS)return 0;
         stalled_drops++;return 1;
     }
