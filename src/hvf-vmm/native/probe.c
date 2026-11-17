@@ -321,10 +321,16 @@ static int snapshot_state(int restore,uint64_t frozen_ticks){
 static int snapshot_gic(int restore){
     int fd=snapshot_open("gic.bin",restore);if(fd<0)return -1;
     hv_gic_state_t state=NULL;size_t size=0;struct stat st;
-    // Both directions take the size the current GIC configuration has: a
-    // restored blob must be exactly that, not anything up to 64 MiB.
+    // The size of the state follows the GIC's state, not only its
+    // configuration: a running Linux guest's is some bytes larger than that
+    // of the GIC just created here. So a restored blob is not required to be
+    // exactly the current size; it is bounded by a small multiple of it, and
+    // hv_gic_set_state validates the content.
     state=hv_gic_state_create();if(!state||hv_gic_state_get_size(state,&size)||!size||size>(64ULL<<20)){if(state)os_release(state);close(fd);return -1;}
-    if(restore&&(fstat(fd,&st)||st.st_size<0||(uint64_t)st.st_size!=size)){os_release(state);close(fd);return -1;}
+    if(restore){
+        if(fstat(fd,&st)||st.st_size<=0||(uint64_t)st.st_size>4*(uint64_t)size){os_release(state);close(fd);return -1;}
+        size=(size_t)st.st_size;
+    }
     void *data=malloc(size);if(!data){if(state)os_release(state);close(fd);return -1;}
     struct snapshot_io io={.fd=fd,.restore=restore};
     if(!restore && hv_gic_state_get_data(state,data))io.error=1;
