@@ -125,6 +125,7 @@ impl Guest {
     pub fn cap_log(&self) {
         let _ = cap_log(&self.1.path().join("startup.log"));
     }
+    /// Callers must not have reaped the leader: see `try_reap`.
     pub fn kill_group(&mut self) -> std::io::Result<()> {
         // The leader is owned and unreaped, preventing reuse of its group ID.
         if unsafe { libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL) } != 0 {
@@ -135,6 +136,46 @@ impl Guest {
         }
         Ok(())
     }
+    /// The leader's state, without reaping it. An exited but unreaped leader
+    /// still holds its PID, and with it the process group ID.
+    fn leader(&self) -> Leader {
+        // SAFETY: zeroed siginfo_t is a valid out-buffer; WNOWAIT leaves the
+        // child waitable, so std's Child still reaps it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.0.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            // ECHILD: Child has reaped it already.
+            return Leader::Reaped;
+        }
+        if info.si_pid == 0 {
+            Leader::Running
+        } else {
+            Leader::Exited
+        }
+    }
+    /// `Child::try_wait` for the leader, that first kills what remains of the
+    /// VM. A leader that exits by itself (a fatal device error calls exit)
+    /// leaves the broker and the socket authority running, and once it is
+    /// reaped its group ID can be reused, so they are signalled before that.
+    pub fn try_reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if self.leader() == Leader::Exited {
+            let _ = self.kill_group();
+        }
+        self.0.try_wait()
+    }
+}
+#[derive(PartialEq)]
+enum Leader {
+    Running,
+    Exited,
+    Reaped,
 }
 impl std::ops::Deref for Guest {
     type Target = Child;
@@ -149,21 +190,24 @@ impl std::ops::DerefMut for Guest {
 }
 impl Drop for Guest {
     fn drop(&mut self) {
-        if self.0.try_wait().ok().flatten().is_none() {
+        // A reaped leader went through try_reap, which killed the rest first.
+        if self.leader() == Leader::Reaped {
+            return;
+        }
+        if self.leader() == Leader::Running {
             // SAFETY: this Child is still unreaped, so its PID cannot be reused.
             unsafe {
                 libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM);
             }
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while self.0.try_wait().ok().flatten().is_none() && std::time::Instant::now() < deadline
-            {
+            while self.leader() == Leader::Running && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            if self.0.try_wait().ok().flatten().is_none() {
-                let _ = self.kill_group();
-            }
-            let _ = self.0.wait();
         }
+        // Whether or not the leader went by itself, nothing of the VM may
+        // outlive it; it is still unreaped, so the group ID is still ours.
+        let _ = self.kill_group();
+        let _ = self.0.wait();
     }
 }
 fn launch(
@@ -350,7 +394,7 @@ fn launch(
         if let Some(error) = resource_error {
             return Err(error.into());
         }
-        let status = guest.try_wait()?;
+        let status = guest.try_reap()?;
         let mut detail = String::new();
         fs::File::open(log_path)?
             .take(65536)
