@@ -311,6 +311,13 @@ fn launch(
     }
     let staging = started.elapsed();
     let mut command = Command::new(std::env::current_exe()?);
+    // The VMM, the broker and the socket authority get only what is set here,
+    // not the operator's environment (tokens, credentials, proxy settings).
+    command.env_clear();
+    // The one operator setting the VMM reads (net_backend_ipc.c).
+    if let Some(value) = std::env::var_os("HVF_NET_DIRECT_STREAM") {
+        command.env("HVF_NET_DIRECT_STREAM", value);
+    }
     command
         .args(["--hvf-child", "--no-api", "--config-file"])
         .arg(config_path)
