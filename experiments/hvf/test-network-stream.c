@@ -177,5 +177,16 @@ int main(void){
     before=received;assert(write(peer,frame,18)==18);stream_poll();assert(received==before+1);close(peer);stream_poll();assert(stream.fd==-1);
     stream.retry=0;stream_connect();assert(stream.fd>=0);peer=accept(listener,NULL,NULL);assert(peer>=0);
     close(peer);close(listener);stream_disconnect();unlink(path);rmdir(dir);
-    puts("PASS stream: read-ahead/budget continuation, callback backpressure, pause, malformed/EOF reset, max frame, TX framing, owner TX backpressure, private sockets and reconnect");
+    // Switch capabilities (EtherType 0x88B5) count only as the first frame of
+    // a link: a later one is dropped here, and a new link starts over.
+    uint8_t caps[18]={0,0,0,14,0xca};caps[16]=0x88;caps[17]=0xb5;
+    peer=pair();stream_disconnect();peer=pair();before=received;
+    assert(write(peer,caps,18)==18);stream_poll();assert(received==before+1);
+    assert(write(peer,frame,18)==18&&write(peer,caps,18)==18&&write(peer,frame,18)==18);stream_poll();
+    assert(received==before+3&&received_ids[before+1]==42&&received_ids[before+2]==42);
+    close(peer);stream_poll();assert(stream.fd==-1);
+    peer=pair();before=received;
+    assert(write(peer,caps,18)==18);stream_poll();assert(received==before+1&&received_ids[before]==0xca);
+    close(peer);stream_disconnect();
+    puts("PASS stream: read-ahead/budget continuation, callback backpressure, pause, malformed/EOF reset, max frame, TX framing, owner TX backpressure, private sockets and reconnect, capabilities only as a link's first frame");
 }

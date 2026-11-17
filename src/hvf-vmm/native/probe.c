@@ -118,9 +118,15 @@ static int cpu_snapshot(struct cpu *c,int restore){
     uint32_t index=c->index;SNAP(&s,index);if(index!=c->index)s.error=1;
     SNAP(&s,c->started);SNAP(&s,c->entry);SNAP(&s,c->context);SNAP(&s,c->os_lock);SNAP(&s,c->os_double_lock);
     if(c->started!=0 && c->started!=1)s.error=1;
+    // The live trap path keeps only bit 0 of each lock: so must a restore.
+    if(c->os_lock>1 || c->os_double_lock>1)s.error=1;
     for(unsigned i=HV_REG_X0;i<=HV_REG_CPSR;i++){
         uint64_t value=0;if(!restore && hv_vcpu_get_reg(c->id,(hv_reg_t)i,&value))s.error=1;
-        SNAP(&s,value);if(restore && !s.error && hv_vcpu_set_reg(c->id,(hv_reg_t)i,value))s.error=1;
+        SNAP(&s,value);
+        // A guest only ever runs at AArch64 EL0t, EL1t or EL1h: the file
+        // format, not Hypervisor.framework, rejects any other saved mode.
+        if(restore && i==HV_REG_CPSR && (value&0x1f)!=0x0 && (value&0x1f)!=0x4 && (value&0x1f)!=0x5)s.error=1;
+        if(restore && !s.error && hv_vcpu_set_reg(c->id,(hv_reg_t)i,value))s.error=1;
     }
     for(unsigned i=0;i<32;i++){
         hv_simd_fp_uchar16_t value={0};if(!restore && hv_vcpu_get_simd_fp_reg(c->id,(hv_simd_fp_reg_t)i,&value))s.error=1;
@@ -227,6 +233,8 @@ static void *cpu_main(void *arg) {
             uint64_t value=0;
             if(!write && (esr&(1ULL<<21)))goto unsupported;
             if(write && reg!=31)CHECK(hv_vcpu_get_reg(c->id,(hv_reg_t)(HV_REG_X0+reg),&value));
+            // Device handlers see only the bits of the access, in both directions.
+            if(write && size<8)value&=(1ULL<<(size*8))-1;
             if(!mmio(ex->exception.physical_address,size,write,&value))goto unsupported;
             if(size<8)value&=(1ULL<<(size*8))-1;
             if(!write && reg!=31)CHECK(hv_vcpu_set_reg(c->id,(hv_reg_t)(HV_REG_X0+reg),value));
@@ -313,8 +321,16 @@ static int snapshot_state(int restore,uint64_t frozen_ticks){
 static int snapshot_gic(int restore){
     int fd=snapshot_open("gic.bin",restore);if(fd<0)return -1;
     hv_gic_state_t state=NULL;size_t size=0;struct stat st;
-    if(restore){if(fstat(fd,&st)||st.st_size<=0||st.st_size>(64LL<<20)){close(fd);return -1;}size=(size_t)st.st_size;}
-    else {state=hv_gic_state_create();if(!state||hv_gic_state_get_size(state,&size)||!size||size>(64ULL<<20)){if(state)os_release(state);close(fd);return -1;}}
+    // The size of the state follows the GIC's state, not only its
+    // configuration: a running Linux guest's is some bytes larger than that
+    // of the GIC just created here. So a restored blob is not required to be
+    // exactly the current size; it is bounded by a small multiple of it, and
+    // hv_gic_set_state validates the content.
+    state=hv_gic_state_create();if(!state||hv_gic_state_get_size(state,&size)||!size||size>(64ULL<<20)){if(state)os_release(state);close(fd);return -1;}
+    if(restore){
+        if(fstat(fd,&st)||st.st_size<=0||(uint64_t)st.st_size>4*(uint64_t)size){os_release(state);close(fd);return -1;}
+        size=(size_t)st.st_size;
+    }
     void *data=malloc(size);if(!data){if(state)os_release(state);close(fd);return -1;}
     struct snapshot_io io={.fd=fd,.restore=restore};
     if(!restore && hv_gic_state_get_data(state,data))io.error=1;

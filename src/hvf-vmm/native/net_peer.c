@@ -13,9 +13,17 @@
 #define PEER_HDR 10
 #define PEER_FRAME (65536+PEER_HDR)
 #define PEER_RX_BUDGET 64
-// A peer that cannot take frames for this long is a stalled link: drop its
-// frames, as the switch's bounded writer does, so it never blocks the TX ring.
+// A peer may keep a refused frame at the head of the TX ring (backpressure)
+// for PEER_STALL_MS in total, plus PEER_CREDIT_MS for each frame it takes.
+// Past that its refused frames are dropped, as the switch's bounded writer
+// does, so it never blocks the ring. The time held is a running balance, not
+// a per-refusal timer and not a latch: a peer that takes nothing is dropped
+// after one PEER_STALL_MS, a peer that frees one slot at a time cannot re-arm
+// the bound and holds the head for PEER_CREDIT_MS per frame at most, and a
+// saturated link that keeps taking frames, although it refuses some every
+// few milliseconds, keeps its backpressure.
 #define PEER_STALL_MS 100
+#define PEER_CREDIT_MS 1
 #define PEER_STATS_MS 1000
 // A link without frames either way for this long is reported idle once, so
 // the switch can reclaim it; traffic that resumes re-creates it on demand.
@@ -24,7 +32,7 @@
 #endif
 struct peer {
     uint64_t id;int fd,dead;uint8_t mac[6],ip[4];
-    uint64_t blocked,active;size_t deferred;uint8_t *buf;int idle;
+    uint64_t held,held_ms,active;size_t deferred;uint8_t *buf;int idle;
 };
 static struct peer peers[PEER_MAX];
 static unsigned npeers,next_rx;
@@ -41,8 +49,9 @@ int net_frame_source_valid(const uint8_t *f,size_t len,const uint8_t mac[6],cons
     if(len<14||memcmp(f+6,mac,6))return 0;
     switch(be16(f+12)){
     case 0x0800:{
+        if(len<34)return 0; // before f[14]: the frame may end right after its Ethernet header
         size_t header=(size_t)(f[14]&15)*4;
-        return len>=34&&f[14]>>4==4&&header>=20&&len>=14+header&&!memcmp(f+26,ip,4);
+        return f[14]>>4==4&&header>=20&&len>=14+header&&!memcmp(f+26,ip,4);
     }
     case 0x0806:
         return len>=42&&be16(f+14)==1&&be16(f+16)==0x0800&&f[18]==6&&f[19]==4&&
@@ -76,8 +85,11 @@ static int configure(int fd){
         setsockopt(fd,SOL_SOCKET,SO_RCVBUF,&size,sizeof(size))?-1:0;
 }
 static int peer_add(const struct peer_message *m,int fd){
-    static const uint8_t zero[4];
-    if(!epoch||m->epoch!=epoch||(m->mac[0]&1)||!memcmp(m->mac,self_mac,6)||!memcmp(m->ip,zero,4)||configure(fd))return 0;
+    static const uint8_t zero[4],broadcast[4]={255,255,255,255};
+    // The switch assigns addresses; a peer claiming this VM's own or the
+    // broadcast address is refused all the same.
+    if(!epoch||m->epoch!=epoch||(m->mac[0]&1)||!memcmp(m->mac,self_mac,6)||!memcmp(m->ip,zero,4)||
+       !memcmp(m->ip,self_ip,4)||!memcmp(m->ip,broadcast,4)||configure(fd))return 0;
     for(unsigned i=0;i<npeers;i++)if(peers[i].id==m->value||!memcmp(peers[i].mac,m->mac,6))peers[i].dead=1;
     compact();
     uint8_t *buf=npeers<PEER_MAX?malloc(PEER_FRAME):NULL;
@@ -141,12 +153,19 @@ int net_peer_send(const uint8_t *vnet_frame,size_t total){
     // Frames the switch would reject go to the switch, which drops and counts them.
     if(!p||!net_frame_source_valid(f,len,self_mac,self_ip))return -1;
     ssize_t n=send(p->fd,vnet_frame,total,MSG_DONTWAIT);
-    if(n==(ssize_t)total){p->blocked=0;p->active=now_ms();p->idle=0;tx_frames++;tx_bytes+=len;return 1;}
-    if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==ENOBUFS)){
+    if(n==(ssize_t)total){
         uint64_t now=now_ms();
-        if(!p->blocked)p->blocked=now;
-        if(now-p->blocked<PEER_STALL_MS)return 0;
-        stalled_drops++;return 1;
+        if(p->held){p->held_ms+=now-p->held;p->held=0;}
+        p->held_ms-=p->held_ms<PEER_CREDIT_MS?p->held_ms:PEER_CREDIT_MS;
+        p->active=now;p->idle=0;tx_frames++;tx_bytes+=len;return 1;
+    }
+    if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==ENOBUFS)){
+        // held: since when the frame at the TX head has been waiting for this
+        // peer (0: none is). held_ms: the balance described at PEER_STALL_MS.
+        uint64_t now=now_ms();
+        if(p->held)p->held_ms+=now-p->held;
+        if(p->held_ms<PEER_STALL_MS){p->held=now;return 0;}
+        p->held=0;stalled_drops++;return 1;
     }
     peer_dead(p);compact();return -1;
 }

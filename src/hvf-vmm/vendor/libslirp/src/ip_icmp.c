@@ -202,6 +202,10 @@ void icmp_input(struct mbuf *m, int hlen)
     DEBUG_ARG("icmp_type = %d", icp->icmp_type);
     switch (icp->icmp_type) {
     case ICMP_ECHO:
+        /* A reassembled echo whose length no longer fits ip_len would wrap
+         * and then skip fragmentation on output: drop it. */
+        if (ip->ip_len > IP_MAXPACKET - hlen)
+            goto freeit;
         ip->ip_len += hlen; /* since ip_input subtracts this */
         if (ip->ip_dst.s_addr == slirp->vhost_addr.s_addr ||
             ip->ip_dst.s_addr == slirp->vnameserver_addr.s_addr) {

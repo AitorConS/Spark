@@ -28,5 +28,5 @@ p=Path('experiments/hvf/build/fuzz-slirp/corpus')
 (p/'ipv4').write_bytes(bytes.fromhex('525400123456525400abcdef08004500001c00000000401100000a00020f0a00020204d2003500080000'))
 PY
 ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 "$out/slirp-fuzzer" "$out/corpus" \
-    -artifact_prefix="$out/artifacts/" -max_len=65536 -timeout=5 -rss_limit_mb=0 -malloc_limit_mb=256 \
+    -artifact_prefix="$out/artifacts/" -max_len=131072 -timeout=5 -rss_limit_mb=0 -malloc_limit_mb=256 \
     -seed=20260911 -max_total_time="${FUZZ_SECONDS:-60}" "$@"

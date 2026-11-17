@@ -119,6 +119,19 @@ pub fn build(
     }
     let n = f.begin_node("chosen")?;
     f.property_string("stdout-path", "/pl011@9000000")?;
+    // Fresh seeds for the guest's CRNG and KASLR on every cold boot; there
+    // is no entropy device. A restored snapshot resumes the RAM it was
+    // captured with, seeds and CRNG state included (see the README).
+    let mut seed = [0u8; 72];
+    // SAFETY: writable buffer of at most 256 bytes, as getentropy requires.
+    if unsafe { libc::getentropy(seed.as_mut_ptr().cast(), seed.len()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    f.property("rng-seed", &seed[..64])?;
+    f.property_u64(
+        "kaslr-seed",
+        u64::from_le_bytes(seed[64..].try_into().unwrap()),
+    )?;
     if let Some(args) = boot_args {
         f.property_string("bootargs", args)?;
     }
@@ -140,6 +153,19 @@ mod tests {
         let base = [0u8, 0, 0, 0, 0x40, 0, 0, 0];
         let at = dtb.windows(8).position(|w| w == base).unwrap();
         std::array::from_fn(|i| u32::from_be_bytes(dtb[at + 4 * i..at + 4 * i + 4].try_into().unwrap()))
+    }
+    #[test]
+    fn every_boot_gets_its_own_seeds() {
+        let tree = |_| build(1, 128, false, None, None).unwrap();
+        let fdt: [Vec<u8>; 2] = std::array::from_fn(tree);
+        // Same layout, different bytes: only the 72 seed bytes differ.
+        assert_eq!(fdt[0].len(), fdt[1].len());
+        let differing = fdt[0].iter().zip(&fdt[1]).filter(|(a, b)| a != b).count();
+        assert!(differing > 32 && differing <= 72, "{differing}");
+        let names = |d: &[u8]| {
+            d.windows(10).any(|w| w == b"kaslr-seed") && d.windows(8).any(|w| w == b"rng-seed")
+        };
+        assert!(names(&fdt[0]));
     }
     #[test]
     fn memory_size_of_4_gib_and_more_uses_the_high_cell() {

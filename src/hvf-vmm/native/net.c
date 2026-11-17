@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "net.h"
 #include "budget.h"
-static struct budget network_budget;
+// Each direction has its own allowance at the configured rates, as upstream
+// Firecracker's RX and TX rate limiters do: frames other guests send to this
+// VM can exhaust only its receive allowance, never its own transmit path.
+static struct budget rx_budget,tx_budget;
 #include <Hypervisor/Hypervisor.h>
 #include "net_backend.h"
 #include "net_peer.h"
@@ -117,6 +120,11 @@ static void deliver(const uint8_t header[10],const uint8_t *frame,size_t len){
 // whole TSO frames for its gateway says so, with the gateway's MAC and MTU,
 // in the first frame of each link; the VMM answers that it takes them too.
 // Without that frame (older jerboad) every TSO frame is segmented as before.
+// The frame is in-band, so its provenance rests on three things: the stream
+// layer drops one that is not the first frame of its link
+// (net_backend_stream.h), the VMM never forwards a guest's frame of this
+// EtherType (to_switch), and the switch never forwards one from a VM's link
+// (UNIX_STREAM.md).
 #define SWITCH_CAPS_TYPE 0x88b5
 #define SWITCH_CAPS_SIZE 60
 #define SWITCH_CAPS_LARGE 1u
@@ -136,6 +144,30 @@ static void answer_switch(void){
     memcpy(f,switch_caps.gateway,6);memcpy(f+6,mac,6);f[12]=SWITCH_CAPS_TYPE>>8;f[13]=SWITCH_CAPS_TYPE&0xff;
     memcpy(f+14,"JRBC",4);f[18]=1;f[19]=SWITCH_CAPS_LARGE;
     if(net_backend_send(f,sizeof(f)))switch_caps.answer=0;
+}
+// A TSO frame for a guest without TSO needs one RX chain per segment, and its
+// sender chooses that count (up to GSO_MAX_SEGMENTS). Waiting for chains is
+// therefore bounded: a frame that needs more chains than the ring can hold is
+// dropped at once, and one still refused after RX_SEGMENT_WAIT_MS is dropped,
+// so no frame retained for segmentation stops delivery from other sources.
+#define RX_SEGMENT_WAIT_MS 100
+static uint64_t segment_since,segment_last;
+static uint64_t rx_now_ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000+(uint64_t)t.tv_nsec/1000000;}
+// Chains of the head's length the ring could ever offer at once.
+static unsigned rx_capacity(struct queue *q){
+    uint16_t i=head(q);unsigned n=0;
+    for(;;){
+        if(++n>QSZ)die("RX cycle");struct desc d=desc(q,i);
+        if(!(d.flags&1))break;i=d.next;
+    }
+    return QSZ/n;
+}
+// Called on each refusal; a gap of a whole window means a new wait.
+static int segment_wait_expired(void){
+    uint64_t now=rx_now_ms();
+    if(!segment_since||now-segment_last>=RX_SEGMENT_WAIT_MS)segment_since=now;
+    segment_last=now;
+    return now-segment_since>=RX_SEGMENT_WAIT_MS;
 }
 // opaque is the frame's virtio_net_hdr when it came from a direct peer
 // (another guest: malformed offloads are dropped, never fatal); NULL for
@@ -171,21 +203,27 @@ static ssize_t receive(const void *buf,size_t len,void *opaque){
         // A guest without TSO receives the segments it would have seen on a wire.
         int count=vnet_gso_count(buf,len,&hd);
         if(queued(q)<(unsigned)count){
-            if(quiescing){drop_packets++;drop_bytes+=len;return (ssize_t)len;}
+            if(quiescing||(unsigned)count>rx_capacity(q)||segment_wait_expired()){
+                segment_since=0;drop_packets++;drop_bytes+=len;return (ssize_t)len;
+            }
             errno=EAGAIN;return -1;
         }
-        if(!budget_take(&network_budget,len,(unsigned)count)){errno=EAGAIN;return -1;}
+        segment_since=0;
+        if(!budget_take(&rx_budget,len,(unsigned)count)){errno=EAGAIN;return -1;}
+        // The checks above make these cannot-fail paths; if they ever disagree
+        // with the segmenter, the frame (from another guest) is dropped: it
+        // must never end this VM.
         for(int s=0;s<count;s++){
             long n=vnet_gso_segment(buf,len,&hd,(unsigned)s,staging,sizeof(staging));
-            if(n<0)die("RX segmentation");
+            if(n<0){drop_packets++;drop_bytes+=len;return (ssize_t)len;}
             deliver(plain,staging,(size_t)n);
         }
         return (ssize_t)len;
     }
-    if(!budget_take(&network_budget,len,1)){errno=EAGAIN;return -1;}
+    if(!budget_take(&rx_budget,len,1)){errno=EAGAIN;return -1;}
     if((hd.flags&VNET_F_NEEDS_CSUM)&&!(features&NET_F_GUEST_CSUM)){
         memcpy(staging,buf,len);
-        if(vnet_complete_csum(staging,len,&hd))die("RX checksum offsets");
+        if(vnet_complete_csum(staging,len,&hd)){drop_packets++;drop_bytes+=len;return (ssize_t)len;}
         deliver(plain,staging,len);return (ssize_t)len;
     }
     deliver(opaque?opaque:plain,buf,len);return (ssize_t)len;
@@ -207,8 +245,23 @@ static int to_switch(uint8_t *frame,size_t len,const struct vnet_hdr *hd){
         }
         tx_resume=0;return 1;
     }
+    // Only the VMM speaks the capability protocol: a guest frame that would
+    // look like the switch's announcement on another VM's link goes nowhere.
+    if((frame[12]<<8|frame[13])==SWITCH_CAPS_TYPE)return 1;
     if((hd->flags&VNET_F_NEEDS_CSUM)&&vnet_complete_csum(frame,len,hd))die("TX checksum offsets");
     return net_backend_send(frame,len);
+}
+// What a TX frame costs against the rate limits: the frames and bytes it
+// stands for on a wire. A TSO frame is charged one packet and one copy of its
+// headers per segment, however it then leaves (segmented for the switch, or
+// whole to a gateway or peer), so gso_size cannot multiply the cap.
+static void tx_cost(const uint8_t *frame,size_t len,const struct vnet_hdr *hd,uint64_t *bytes,uint64_t *packets){
+    *bytes=len;*packets=1;
+    int count=hd->gso_type?vnet_gso_count(frame,len,hd):1;
+    if(count>1){
+        size_t headers=14+(size_t)(frame[14]&15)*4;headers+=(size_t)(frame[headers+12]>>4)*4;
+        *bytes=len+(uint64_t)(count-1)*headers;*packets=(uint64_t)count;
+    }
 }
 static void transmit(void){
     struct queue *q=&queues[1];
@@ -225,7 +278,8 @@ static void transmit(void){
         if((hd.flags&~VNET_F_NEEDS_CSUM)||((hd.flags&VNET_F_NEEDS_CSUM)&&!(features&NET_F_CSUM))||
            (hd.gso_type&&(hd.gso_type!=VNET_GSO_TCPV4||!(features&NET_F_HOST_TSO4))))die("TX header/offload unsupported");
         if(tx_resume&&(h!=tx_resume_head||q->pfn!=tx_resume_pfn||!hd.gso_type))tx_resume=0;
-        if(!tx_resume&&!budget_take(&network_budget,len-10,1))break;
+        uint64_t cost_bytes,cost_packets;tx_cost(frame+10,len-10,&hd,&cost_bytes,&cost_packets);
+        if(!tx_resume&&!budget_take(&tx_budget,cost_bytes,cost_packets))break;
         // A full socket is backpressure, not packet loss. Leave this
         // descriptor available and retry it on the next supervisor poll.
         // Direct peers take the frame whole; everything else (and anything
@@ -236,16 +290,17 @@ static void transmit(void){
         // frame cut short (tx_resume) keeps it for its remaining segments.
         if(!sent){
             if(tx_resume){tx_resume_head=h;tx_resume_pfn=q->pfn;}
-            else budget_refund(&network_budget,len-10,1);
+            else budget_refund(&tx_budget,cost_bytes,cost_packets);
             break;
         }
         complete(q,h,0);tx++;tx_bytes+=len-10;
     }
 }
 int net_init(void *memory,size_t size,const struct hvf_options *options){
-    budget_init(&network_budget,options->network_bytes_per_second,options->network_packets_per_second,256ULL<<10,256);
+    budget_init(&rx_budget,options->network_bytes_per_second,options->network_packets_per_second,256ULL<<10,256);
+    budget_init(&tx_budget,options->network_bytes_per_second,options->network_packets_per_second,256ULL<<10,256);
     memset(cfg,0,sizeof(cfg));memset(queues,0,sizeof(queues));
-    status=isr=features=selectq=rx=tx=0;quiescing=0;bar=BAR;tx_resume=0;memset(&switch_caps,0,sizeof(switch_caps));
+    status=isr=features=selectq=rx=tx=0;quiescing=0;segment_since=segment_last=0;bar=BAR;tx_resume=0;memset(&switch_caps,0,sizeof(switch_caps));
     rx_bytes=tx_bytes=drop_packets=drop_bytes=0;
     ram=memory;ram_size=size;enabled=options->network_enabled;if(!enabled)return 0;
     memcpy(mac,options->mac,6);

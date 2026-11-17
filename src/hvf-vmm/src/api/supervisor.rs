@@ -80,7 +80,9 @@ fn open_log(path: &Path, write: bool) -> std::io::Result<fs::File> {
     let file = fs::OpenOptions::new()
         .read(true)
         .append(write)
-        .custom_flags(libc::O_NOFOLLOW)
+        // O_NONBLOCK: a FIFO put in its place must not block the open; it is
+        // then refused as not a regular file. No effect on a regular file.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() || meta.nlink() != 1 {
@@ -125,16 +127,68 @@ impl Guest {
     pub fn cap_log(&self) {
         let _ = cap_log(&self.1.path().join("startup.log"));
     }
+    /// Kills every process of the VM: its process group, the leader itself
+    /// and any recorded member that left the group (see limits::members).
+    /// Callers must not have reaped the leader: see `try_reap`.
     pub fn kill_group(&mut self) -> std::io::Result<()> {
+        let leader = self.0.id();
+        // A member that left the group is found by descent before the group
+        // is killed, while its parent still exists.
+        self.5.kill_members(leader);
         // The leader is owned and unreaped, preventing reuse of its group ID.
-        if unsafe { libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL) } != 0 {
+        let mut result = Ok(());
+        if unsafe { libc::kill(-(leader as libc::pid_t), libc::SIGKILL) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error);
+                result = Err(error);
             }
         }
-        Ok(())
+        // The leader too, should it have left its own group: its PID is ours
+        // until it is reaped, and Drop waits for it.
+        // SAFETY: plain signal to an unreaped child.
+        unsafe { libc::kill(leader as libc::pid_t, libc::SIGKILL) };
+        result
     }
+    /// The leader's state, without reaping it. An exited but unreaped leader
+    /// still holds its PID, and with it the process group ID.
+    fn leader(&self) -> Leader {
+        // SAFETY: zeroed siginfo_t is a valid out-buffer; WNOWAIT leaves the
+        // child waitable, so std's Child still reaps it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.0.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            // ECHILD: Child has reaped it already.
+            return Leader::Reaped;
+        }
+        if info.si_pid == 0 {
+            Leader::Running
+        } else {
+            Leader::Exited
+        }
+    }
+    /// `Child::try_wait` for the leader, that first kills what remains of the
+    /// VM. A leader that exits by itself (a fatal device error calls exit)
+    /// leaves the broker and the socket authority running, and once it is
+    /// reaped its group ID can be reused, so they are signalled before that.
+    pub fn try_reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if self.leader() == Leader::Exited {
+            let _ = self.kill_group();
+        }
+        self.0.try_wait()
+    }
+}
+#[derive(PartialEq)]
+enum Leader {
+    Running,
+    Exited,
+    Reaped,
 }
 impl std::ops::Deref for Guest {
     type Target = Child;
@@ -149,21 +203,24 @@ impl std::ops::DerefMut for Guest {
 }
 impl Drop for Guest {
     fn drop(&mut self) {
-        if self.0.try_wait().ok().flatten().is_none() {
+        // A reaped leader went through try_reap, which killed the rest first.
+        if self.leader() == Leader::Reaped {
+            return;
+        }
+        if self.leader() == Leader::Running {
             // SAFETY: this Child is still unreaped, so its PID cannot be reused.
             unsafe {
                 libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM);
             }
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while self.0.try_wait().ok().flatten().is_none() && std::time::Instant::now() < deadline
-            {
+            while self.leader() == Leader::Running && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            if self.0.try_wait().ok().flatten().is_none() {
-                let _ = self.kill_group();
-            }
-            let _ = self.0.wait();
         }
+        // Whether or not the leader went by itself, nothing of the VM may
+        // outlive it; it is still unreaped, so the group ID is still ours.
+        let _ = self.kill_group();
+        let _ = self.0.wait();
     }
 }
 fn launch(
@@ -256,6 +313,13 @@ fn launch(
     }
     let staging = started.elapsed();
     let mut command = Command::new(std::env::current_exe()?);
+    // The VMM, the broker and the socket authority get only what is set here,
+    // not the operator's environment (tokens, credentials, proxy settings).
+    command.env_clear();
+    // The one operator setting the VMM reads (net_backend_ipc.c).
+    if let Some(value) = std::env::var_os("HVF_NET_DIRECT_STREAM") {
+        command.env("HVF_NET_DIRECT_STREAM", value);
+    }
     command
         .args(["--hvf-child", "--no-api", "--config-file"])
         .arg(config_path)
@@ -274,6 +338,9 @@ fn launch(
                 .collect::<Vec<_>>()
                 .join(","),
         )
+        // The VMM never reads stdin (the console is output-only), and must not
+        // hold the operator's terminal open for reading.
+        .stdin(std::process::Stdio::null())
         // Append-only, so cap_log can shorten it while the VMM keeps writing.
         .stderr(
             fs::OpenOptions::new()
@@ -281,7 +348,7 @@ fn launch(
                 .append(true)
                 .open(&log_path)?,
         );
-    // SAFETY: only async-signal-safe fcntl executes between fork and exec. The
+    // SAFETY: only async-signal-safe setsid and fcntl execute between fork and exec. The
     // private socket descriptor remains alive until spawn completes.
     unsafe {
         command.pre_exec(move || {
@@ -290,7 +357,11 @@ fn launch(
                     return Err(std::io::Error::last_os_error());
                 }
             }
-            if libc::setpgid(0, 0) < 0
+            // A session of its own (and so a process group whose ID is its
+            // PID, which kill_group signals): no controlling terminal, so the
+            // stdout it keeps for the console grants no terminal control
+            // (TIOCSTI, foreground group) over the operator's shell.
+            if libc::setsid() < 0
                 || libc::fcntl(fd, libc::F_SETFD, 0) < 0
                 || libc::fcntl(metrics_fd, libc::F_SETFD, 0) < 0
                 || libc::fcntl(lease_fd, libc::F_SETFD, 0) < 0
@@ -350,14 +421,16 @@ fn launch(
         if let Some(error) = resource_error {
             return Err(error.into());
         }
-        let status = guest.try_wait()?;
-        let mut detail = String::new();
-        fs::File::open(log_path)?
+        let status = guest.try_reap()?;
+        // The VMM can write its work directory: read the log as every other
+        // reader does (no link, regular, one name), and as bytes.
+        let mut detail = Vec::new();
+        open_log(&log_path, false)?
             .take(65536)
-            .read_to_string(&mut detail)?;
+            .read_to_end(&mut detail)?;
         return Err(format!(
             "BOOT_FAILED: {reason} (status {status:?}): {}",
-            detail.trim()
+            String::from_utf8_lossy(&detail).trim()
         )
         .into());
     }
@@ -446,6 +519,16 @@ mod tests {
         // Under the cap nothing changes.
         cap_log(&path).unwrap();
         assert_eq!(fs::read(&path).unwrap(), trimmed);
+    }
+
+    #[test]
+    fn open_log_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("startup.log");
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(open_log(&path, false).is_err());
     }
 
     #[test]

@@ -9,10 +9,16 @@ on:
         options: [hvf, kvm]
 permissions:
   contents: read
+# Self-hosted hardware runners execute the checked-out ref, with sudo on the
+# KVM host. Each job waits for the protected `hardware-validation`
+# environment; the repository settings that actually bind these runners to
+# reviewed code are listed in experiments/hvf/ci/README.md, and
+# experiments/hvf/ci/check-workflows.py keeps every self-hosted job here.
 jobs:
   hvf:
     if: inputs.backend == 'hvf'
     runs-on: [self-hosted, macOS, ARM64, hvf-macos26]
+    environment: hardware-validation
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -22,6 +28,7 @@ jobs:
   kvm:
     if: inputs.backend == 'kvm'
     runs-on: [self-hosted, Linux, X64, kvm-validation]
+    environment: hardware-validation
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

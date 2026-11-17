@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define BASE 0x40000000ULL
 #define BAR 0x10010000ULL
@@ -29,13 +30,15 @@ static net_receive_fn receive;
 static uint8_t sent[64][65536];
 static size_t sent_len[64];
 static unsigned sends,fail_at=~0u;
+static uint64_t sent_bytes;
 
 hv_return_t hv_gic_set_spi(uint32_t intid,bool asserted){(void)intid;(void)asserted;return HV_SUCCESS;}
 int net_backend_open(const struct hvf_options *options,net_receive_fn fn){(void)options;receive=fn;return 0;}
 int net_backend_send(const void *data,size_t size){
     if(sends==fail_at){fail_at=~0u;return 0;} // the broker socket is full once
-    assert(sends<64&&size<=sizeof(sent[0]));
-    memcpy(sent[sends],data,size);sent_len[sends++]=size;return 1;
+    assert(size<=sizeof(sent[0]));
+    if(sends<64){memcpy(sent[sends],data,size);sent_len[sends]=size;}
+    sends++;sent_bytes+=size;return 1;
 }
 void net_backend_poll(void){}
 void net_backend_kick(void){}
@@ -240,6 +243,12 @@ static void test_switch_capabilities(void){
         const uint8_t *p=rx_packet(i);size_t n=*used_len(RX_RING,i)-10;
         assert(n==ETH+40+(i<3?8960:30000-3*8960)&&tcp_valid(p+10,n));
     }
+    // A guest's frame of the capability EtherType never reaches the switch,
+    // where it could pass for the switch's announcement on another VM's link.
+    sends=0;uint8_t forged[70]={0};memcpy(forged+10,"\x02\0\0\0\0\x03\x02\0\0\0\0\x01\x88\xb5JRBC\x01\x01\x02\x40",22);
+    uint16_t completed=*used_idx(TX_RING);
+    tx(forged,sizeof(forged));
+    assert(sends==0&&*used_idx(TX_RING)==completed+1);
     // An oversized frame that is not whole TCPv4 is dropped, never fatal.
     setup(FEATURES);reset_slots();post_rx(1,65536);
     net_metrics(metrics);uint64_t drops=metrics[4];
@@ -263,6 +272,85 @@ static void test_rx_oversized(void){
     assert(receive(frame,60,NULL)==60);
     assert(*used_idx(RX_RING)==1&&*used_len(RX_RING,0)==70);
 }
+// A TSO frame from another guest, for a guest without TSO, needs one RX chain
+// per segment and its sender picks the count. One that can never fit in the
+// ring is dropped at once; one that could is retained only for a bounded time.
+// Either way frames behind it are delivered again.
+static void post_rx_chains(unsigned count){
+    struct descriptor *d=(void *)(memory+RX_RING);
+    for(unsigned k=0;k<count;k++){
+        unsigned slot=rx_slot;rx_slot+=2; // a header and a data descriptor, as legacy drivers post
+        d[slot]=(struct descriptor){BASE+RX_BUF+slot*2048,10,3,(uint16_t)(slot+1)};
+        d[slot+1]=(struct descriptor){BASE+RX_BUF+(slot+1)*2048,2048,2,0};
+        avail(RX_RING)[2+(avail(RX_RING)[1]%256)]=(uint16_t)slot;avail(RX_RING)[1]++;
+    }
+}
+static void test_rx_segment_bound(void){
+    static uint8_t packet[65536];uint64_t metrics[6];
+    setup(0x20);reset_slots();
+    post_rx_chains(100); // at most 128 two-descriptor chains fit in the ring
+    net_metrics(metrics);uint64_t drops=metrics[4];
+    // gso_size 1: 200 segments can never fit, so the frame is dropped, not retained.
+    size_t len=tso_packet(packet,200,1);
+    assert(receive(packet+10,len-10,packet)==(ssize_t)(len-10));
+    net_metrics(metrics);assert(metrics[4]==drops+1&&*used_idx(RX_RING)==0);
+    // 120 segments could fit once the guest posts more chains: backpressure,
+    // but only for a bounded time.
+    len=tso_packet(packet,120,1);
+    errno=0;assert(receive(packet+10,len-10,packet)<0&&errno==EAGAIN);
+    ssize_t result=-1;
+    for(int i=0;i<300&&result<0;i++){usleep(1000);result=receive(packet+10,len-10,packet);}
+    assert(result==(ssize_t)(len-10));
+    net_metrics(metrics);assert(metrics[4]==drops+2&&*used_idx(RX_RING)==0);
+    // The next frame is delivered, and a later wait starts a fresh window.
+    uint8_t plain[60]={0};
+    assert(receive(plain,sizeof(plain),NULL)==sizeof(plain)&&*used_idx(RX_RING)==1);
+    usleep(150000);
+    errno=0;assert(receive(packet+10,len-10,packet)<0&&errno==EAGAIN);
+    post_rx_chains(27); // 126 chains now queued
+    assert(receive(packet+10,len-10,packet)==(ssize_t)(len-10)&&*used_idx(RX_RING)==121);
+    net_metrics(metrics);assert(metrics[4]==drops+2);
+}
+// Rate limits apply to each direction separately: a stream of frames from
+// other guests that empties the receive allowance leaves this VM's own
+// transmissions unaffected.
+static void limited(uint64_t bytes,uint64_t packets){
+    net_close();
+    struct hvf_options options={.network_enabled=1,.network_bytes_per_second=bytes,.network_packets_per_second=packets};
+    assert(net_init(memory,SIZE,&options)==0);
+}
+static void test_rx_cannot_spend_tx_budget(void){
+    static uint8_t packet[65536];
+    limited(1<<20,0); // 256 KiB burst
+    setup(FEATURES);reset_slots();sends=0;
+    // Inbound 1500-byte frames until the receive allowance is gone.
+    uint8_t frame[1500]={0};unsigned delivered=0;
+    for(;;){
+        if(rx_slot>=64){setup(FEATURES);reset_slots();} // a fresh RX ring; the budget is the device's
+        post_rx(1,2048);
+        if(receive(frame,sizeof(frame),NULL)<0)break;
+        delivered++;
+    }
+    assert(errno==EAGAIN&&delivered>=100&&delivered<=180);
+    // A full-size frame of this VM's own still goes out at once.
+    size_t len=tso_packet(packet,1460,0);
+    tx(packet,len);
+    assert(sends==1&&*used_idx(TX_RING)==1);
+    limited(0,0);
+}
+// A TSO frame costs one packet per segment it becomes: under a packet cap,
+// a tiny gso_size cannot turn one token into hundreds of wire frames.
+static void test_tx_tso_charged_per_segment(void){
+    static uint8_t packet[65536];
+    limited(0,1); // 256-packet burst
+    setup(FEATURES);reset_slots();sends=0;sent_bytes=0;
+    size_t len=tso_packet(packet,200,1);
+    tx(packet,len);
+    assert(sends==200&&*used_idx(TX_RING)==1);
+    tx(packet,len); // 56 tokens left: retained, not sent
+    assert(sends==200&&*used_idx(TX_RING)==1);
+    limited(0,0);
+}
 int main(void){
     memory=calloc(1,SIZE);assert(memory);
     struct hvf_options options={.network_enabled=1};
@@ -271,6 +359,9 @@ int main(void){
     test_tx_resume_bound_to_frame();
     test_rx_from_peer();
     test_rx_oversized();
+    test_rx_segment_bound();
+    test_rx_cannot_spend_tx_budget();
+    test_tx_tso_charged_per_segment();
     test_switch_capabilities();
     net_close();free(memory);
     puts("net-offload: ok");

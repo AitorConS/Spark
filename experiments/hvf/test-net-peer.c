@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 static const uint8_t self_mac[6]={2,0,0,0,0,1},self_ip[4]={10,0,0,1};
@@ -84,6 +85,9 @@ static void test_source_contract(void){
     assert(!net_frame_source_valid(f,arp(f,peer_mac,self_mac,peer_ip),self_mac,self_ip));
     ipv4(f,peer_mac,self_mac,self_ip,60);f[12]=0x86;f[13]=0xdd;
     assert(!net_frame_source_valid(f,60,self_mac,self_ip));                                     // IPv6
+    // An IPv4 frame that ends with its Ethernet header is read no further (ASan checks).
+    uint8_t *exact=malloc(14);assert(exact);memcpy(exact,f,12);exact[12]=8;exact[13]=0;
+    assert(!net_frame_source_valid(exact,14,self_mac,self_ip));free(exact);
 }
 static void test_protocol(void){
     uint8_t wire[PEER_MESSAGE];struct peer_message in={.type=PEER_ADD,.flags=1,.epoch=0x1122334455667788ULL,.value=0xa0b0c0d0},out;
@@ -116,6 +120,16 @@ static void test_data_plane(void){
     send_message(channel[1],&stale,link[0]);close(link[0]);close(link[1]);
     net_peer_poll();
     assert(read_message(channel[1],&m)<0&&m.type==PEER_ACK&&m.flags==0&&m.value==42);
+
+    // A peer may not claim this VM's own address, nor the broadcast address.
+    static const uint8_t broadcast_ip[4]={255,255,255,255};
+    for(int i=0;i<2;i++){
+        struct peer_message claim=add;memcpy(claim.ip,i?broadcast_ip:self_ip,4);
+        assert(!socketpair(AF_UNIX,SOCK_DGRAM,0,link));
+        send_message(channel[1],&claim,link[0]);close(link[0]);close(link[1]);
+        net_peer_poll();
+        assert(read_message(channel[1],&m)<0&&m.type==PEER_ACK&&m.flags==0);
+    }
 
     // A stream socket is not an Ethernet link.
     assert(!socketpair(AF_UNIX,SOCK_STREAM,0,link));
@@ -255,7 +269,120 @@ static void test_relay(void){
     assert(read_message(sw,&m)<0&&m.type==PEER_HELLO);
     close(sw);usleep(10000);relay_service();
     assert(relay.ctl<0&&read_message(channel[1],&m)<0&&m.type==PEER_RESET);
+
+    // A channel the VMM does not drain (it is paused) must never lose a
+    // withdrawal: the broker fails closed, ends the switch session, and owes
+    // the VMM a RESET, relaying nothing else, until the RESET is delivered.
+    relay.retry=0;relay_service();
+    for(int i=0;i<100&&relay.connecting;i++){relay_service();usleep(1000);}
+    sw=accept(listener,NULL,NULL);assert(sw>=0);set_timeout(sw);
+    assert(read_message(sw,&m)<0&&m.type==PEER_HELLO);
+    struct peer_message del={.type=PEER_DEL,.epoch=3,.value=99};
+    for(int i=0;i<4096&&relay.ctl>=0;i++){send_message(sw,&del,-1);usleep(100);relay_service();}
+    assert(relay.ctl<0&&relay.reset_owed);
+    char byte2;assert(recv(sw,&byte2,1,0)==0); // the switch sees the session end
+    close(sw);
+    relay.retry=0;relay_service();assert(relay.ctl<0&&!relay.connecting); // no new session yet
+    unsigned dels=0;int reset=0;
+    for(int round=0;round<100&&!reset;round++){
+        uint8_t wire[PEER_MESSAGE];
+        while(recv(channel[1],wire,sizeof(wire),MSG_DONTWAIT)==(ssize_t)sizeof(wire)){
+            assert(!peer_decode(wire,&m)&&!reset);
+            if(m.type==PEER_RESET)reset=1;else{assert(m.type==PEER_DEL);dels++;}
+        }
+        relay_service();
+    }
+    assert(reset&&dels>0&&!relay.reset_owed);
+    // Then the broker reconnects as usual.
+    relay.retry=0;relay_service();
+    for(int i=0;i<100&&relay.connecting;i++){relay_service();usleep(1000);}
+    sw=accept(listener,NULL,NULL);assert(sw>=0);set_timeout(sw);
+    assert(read_message(sw,&m)<0&&m.type==PEER_HELLO);
+    close(sw);usleep(10000);relay_service();
+    assert(relay.ctl<0&&read_message(channel[1],&m)<0&&m.type==PEER_RESET);
     close(listener);unlink(path);rmdir(directory);close(channel[0]);close(channel[1]);
+}
+// A peer that frees one datagram slot at a time must not re-arm the stall
+// bound with each send that fits: the time net_peer_send keeps the TX head
+// (returns 0) is bounded overall, by the frames the peer takes, not per
+// refusal episode.
+static uint64_t test_ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000+(uint64_t)t.tv_nsec/1000000;}
+static void test_trickle_stall(void){
+    int channel[2],link[2];
+    assert(!socketpair(AF_UNIX,SOCK_DGRAM,0,channel)&&!socketpair(AF_UNIX,SOCK_DGRAM,0,link));
+    set_timeout(channel[1]);size_link(link[1]);
+    net_peer_open(channel[0],self_mac,deliver);
+    struct peer_message welcome={.type=PEER_WELCOME,.epoch=13};memcpy(welcome.mac,self_mac,6);memcpy(welcome.ip,self_ip,4);
+    struct peer_message add={.type=PEER_ADD,.epoch=13,.value=4};memcpy(add.mac,peer_mac,6);memcpy(add.ip,peer_ip,4);
+    send_message(channel[1],&welcome,-1);send_message(channel[1],&add,link[0]);close(link[0]);
+    net_peer_poll();
+    struct peer_message m;assert(read_message(channel[1],&m)<0&&m.type==PEER_ACK&&m.flags==1);
+    static uint8_t f[9010],got[65536];size_t size=vipv4(f,peer_mac,self_mac,self_ip,9000);
+    while(net_peer_send(f,size)==1){}
+    // The peer reads one datagram every 20 ms; the sender offers two frames each time.
+    uint64_t start=test_ms(),retained=0,last=start;int last_zero=1;
+    while(test_ms()-start<800){
+        usleep(20000);
+        (void)recv(link[1],got,sizeof(got),MSG_DONTWAIT);
+        for(int i=0;i<2;i++){
+            uint64_t now=test_ms();
+            if(last_zero)retained+=now-last;
+            last=now;last_zero=net_peer_send(f,size)==0;
+        }
+    }
+    // Before the bound was cumulative the head stayed retained for the whole 800 ms.
+    if(retained>=300){fprintf(stderr,"trickling peer retained the TX head for %llu ms\n",(unsigned long long)retained);abort();}
+    uint64_t metrics[7];net_peer_metrics(metrics);assert(metrics[5]>0);
+    // A link that drains and takes frames again earns its backpressure back:
+    // by the time it is full, the refused frame is held, not dropped.
+    while(recv(link[1],got,sizeof(got),MSG_DONTWAIT)>0){}
+    uint64_t dropped=metrics[5];int result;
+    assert(net_peer_send(f,size)==1);
+    while((result=net_peer_send(f,size))==1){net_peer_metrics(metrics);assert(metrics[5]==dropped);}
+    assert(result==0);
+    while(recv(link[1],got,sizeof(got),MSG_DONTWAIT)>0){}
+    net_peer_close();close(channel[1]);close(link[1]);
+}
+// A saturated but healthy peer keeps refusing frames, because the sender is
+// faster than it, yet takes many between refusals. It must see backpressure
+// for as long as that lasts, never drops: the stall bound is for a peer that
+// holds the TX head without taking frames.
+static void test_saturated_link(void){
+    int channel[2],link[2];
+    assert(!socketpair(AF_UNIX,SOCK_DGRAM,0,channel)&&!socketpair(AF_UNIX,SOCK_DGRAM,0,link));
+    set_timeout(channel[1]);size_link(link[1]);
+    net_peer_open(channel[0],self_mac,deliver);
+    struct peer_message welcome={.type=PEER_WELCOME,.epoch=17};memcpy(welcome.mac,self_mac,6);memcpy(welcome.ip,self_ip,4);
+    struct peer_message add={.type=PEER_ADD,.epoch=17,.value=5};memcpy(add.mac,peer_mac,6);memcpy(add.ip,peer_ip,4);
+    send_message(channel[1],&welcome,-1);send_message(channel[1],&add,link[0]);close(link[0]);
+    net_peer_poll();
+    struct peer_message m;assert(read_message(channel[1],&m)<0&&m.type==PEER_ACK&&m.flags==1);
+    static uint8_t f[9010],got[65536];size_t size=vipv4(f,peer_mac,self_mac,self_ip,9000);
+    // Every 2 ms the peer reads eight frames and the sender refills the link
+    // until it is refused: a refusal each cycle, for five stall windows.
+    uint64_t start=test_ms(),accepted=0,refusals=0,received=0,metrics[7]={0};
+    while(test_ms()-start<500&&!metrics[5]){
+        int result;
+        // A dropped frame also returns 1: the drop counter tells them apart.
+        while((result=net_peer_send(f,size))==1){
+            net_peer_metrics(metrics);
+            if(metrics[5])break;
+            accepted++;
+        }
+        if(metrics[5])break;
+        assert(result==0);refusals++;
+        usleep(2000);
+        for(int i=0;i<8;i++)if(recv(link[1],got,sizeof(got),MSG_DONTWAIT)>0)received++;
+    }
+    while(recv(link[1],got,sizeof(got),MSG_DONTWAIT)>0)received++;
+    net_peer_metrics(metrics);
+    if(metrics[5]||received!=accepted){
+        fprintf(stderr,"saturated link: %llu frames dropped as stalled, %llu accepted, %llu received, %llu refusals\n",
+            (unsigned long long)metrics[5],(unsigned long long)accepted,(unsigned long long)received,(unsigned long long)refusals);
+        abort();
+    }
+    assert(refusals>20&&metrics[0]==accepted);
+    net_peer_close();close(channel[1]);close(link[1]);
 }
 // Built with PEER_IDLE_MS=400: a quiet link is reported idle exactly once,
 // and traffic makes it active again.
@@ -323,6 +450,8 @@ int main(void){
     test_data_plane();
     test_relay();
     test_idle();
+    test_trickle_stall();
+    test_saturated_link();
     test_sandboxed_vmm();
     puts("net-peer: ok");
     return 0;

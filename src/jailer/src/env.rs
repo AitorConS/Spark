@@ -133,26 +133,92 @@ pub struct Env {
     uffd_dev_minor: Option<u32>,
 }
 
-/// Creates a new file owned by the given uid/gid at `dst` and writes `line`
-/// into it, plus a trailing newline.
+/// Creates `relative`, a chain of plain names, under the directory `root` and returns the
+/// innermost directory, opened. The jail root belongs to the jailed uid, which could have
+/// replaced any entry under it with a symlink (for instance between two runs over one root):
+/// each component is therefore created and opened relative to its parent's descriptor with
+/// `O_NOFOLLOW`, so nothing under the root can redirect the jailer, which is still root and in
+/// the host's mount namespace, to a directory outside it.
+#[cfg(target_arch = "aarch64")]
+fn create_dir_all_beneath(root: &Path, relative: &Path) -> Result<File, JailerError> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+
+    let mut path = root.to_path_buf();
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(root)
+        .map_err(|err| JailerError::CreateDir(path.clone(), err))?;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(JailerError::CreateDir(
+                path,
+                io::Error::from(io::ErrorKind::InvalidInput),
+            ));
+        };
+        path.push(name);
+        // Safe to unwrap: path components contain no NUL byte.
+        let name = CString::new(name.as_bytes()).unwrap();
+        // SAFETY: valid directory descriptor and NUL-terminated name.
+        if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o777) } != 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EEXIST) {
+                return Err(JailerError::CreateDir(path, err));
+            }
+        }
+        // SAFETY: as above; the returned descriptor is owned by the new File.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(JailerError::CreateDir(path, io::Error::last_os_error()));
+        }
+        // SAFETY: fd is a newly opened descriptor that nothing else owns.
+        directory = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(directory)
+}
+
+/// Creates a new file `name` owned by the given uid/gid in `directory` (opened by
+/// `create_dir_all_beneath`, whose path is `path`) and writes `line` into it, plus a trailing
+/// newline.
 #[cfg(target_arch = "aarch64")]
 fn create_owned_file_with_data(
-    dst: &Path,
+    directory: &File,
+    path: &Path,
+    name: &str,
     line: String,
     uid: u32,
     gid: u32,
 ) -> Result<(), JailerError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        // `create_new` maps to `O_CREAT | O_EXCL`: fail if `dst` already exists.
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(dst)
-        .map_err(|err| JailerError::Write(dst.to_path_buf(), err))?;
+    use std::os::unix::io::FromRawFd;
+
+    let dst = path.join(name);
+    // Safe to unwrap: the names are constants without a NUL byte.
+    let c_name = CString::new(name).unwrap();
+    // SAFETY: valid directory descriptor and NUL-terminated name. `O_CREAT | O_EXCL`: fail if
+    // the file already exists; `O_NOFOLLOW`: never through a symlink.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o666,
+        )
+    };
+    if fd < 0 {
+        return Err(JailerError::Write(dst, io::Error::last_os_error()));
+    }
+    // SAFETY: fd is a newly opened descriptor that nothing else owns.
+    let mut file = unsafe { File::from_raw_fd(fd) };
     file.write_all(format!("{}\n", line).as_bytes())
-        .map_err(|err| JailerError::Write(dst.to_path_buf(), err))?;
-    fchown(&file, Some(uid), Some(gid))
-        .map_err(|err| JailerError::ChangeFileOwner(dst.to_path_buf(), err))
+        .map_err(|err| JailerError::Write(dst.clone(), err))?;
+    fchown(&file, Some(uid), Some(gid)).map_err(|err| JailerError::ChangeFileOwner(dst, err))
 }
 
 impl Env {
@@ -587,10 +653,9 @@ impl Env {
         ];
 
         // We create the cache folder inside the chroot and then change its permissions.
-        let jailer_cache_dir =
-            Path::new(self.chroot_dir()).join("sys/devices/system/cpu/cpu0/cache/");
-        fs::create_dir_all(&jailer_cache_dir)
-            .map_err(|err| JailerError::CreateDir(jailer_cache_dir.to_owned(), err))?;
+        const JAILER_CACHE_INFO: &str = "sys/devices/system/cpu/cpu0/cache";
+        let jailer_cache_dir = Path::new(self.chroot_dir()).join(JAILER_CACHE_INFO);
+        create_dir_all_beneath(self.chroot_dir(), Path::new(JAILER_CACHE_INFO))?;
 
         for index in 0..(MAX_CACHE_LEVEL + 1) {
             let index_folder = format!("index{}", index);
@@ -604,17 +669,25 @@ impl Env {
 
             // We now create the destination folder in the jailer.
             let jailer_path = jailer_cache_dir.join(&index_folder);
-            fs::create_dir_all(&jailer_path)
-                .map_err(|err| JailerError::CreateDir(jailer_path.to_owned(), err))?;
+            let jailer_directory = create_dir_all_beneath(
+                self.chroot_dir(),
+                &Path::new(JAILER_CACHE_INFO).join(&index_folder),
+            )?;
 
             // We now read the contents of the current directory and copy the files we are
             // interested in to the destination path.
             for entry in FOLDER_HIERARCHY.iter() {
                 let host_cache_file = host_path.join(entry);
-                let jailer_cache_file = jailer_path.join(entry);
 
                 if let Ok(line) = readln_special(&host_cache_file) {
-                    create_owned_file_with_data(&jailer_cache_file, line, self.uid(), self.gid())?;
+                    create_owned_file_with_data(
+                        &jailer_directory,
+                        &jailer_path,
+                        entry,
+                        line,
+                        self.uid(),
+                        self.gid(),
+                    )?;
                 }
             }
         }
@@ -627,18 +700,24 @@ impl Env {
 
         const HOST_MIDR_EL1_INFO: &str = "/sys/devices/system/cpu/cpu0/regs/identification";
 
+        const JAILER_MIDR_EL1_INFO: &str = "sys/devices/system/cpu/cpu0/regs/identification";
+        let jailer_midr_el1_path = Path::new(self.chroot_dir()).join(JAILER_MIDR_EL1_INFO);
         let jailer_midr_el1_directory =
-            Path::new(self.chroot_dir()).join("sys/devices/system/cpu/cpu0/regs/identification/");
-        fs::create_dir_all(&jailer_midr_el1_directory)
-            .map_err(|err| JailerError::CreateDir(jailer_midr_el1_directory.to_owned(), err))?;
+            create_dir_all_beneath(self.chroot_dir(), Path::new(JAILER_MIDR_EL1_INFO))?;
 
         let host_midr_el1_file = PathBuf::from(format!("{}/midr_el1", HOST_MIDR_EL1_INFO));
-        let jailer_midr_el1_file = jailer_midr_el1_directory.join("midr_el1");
 
         // Read the host MIDR_EL1 value and write it into the jail, owned by
         // the jailed uid:gid.
         let line = readln_special(&host_midr_el1_file)?;
-        create_owned_file_with_data(&jailer_midr_el1_file, line, self.uid(), self.gid())?;
+        create_owned_file_with_data(
+            &jailer_midr_el1_directory,
+            &jailer_midr_el1_path,
+            "midr_el1",
+            line,
+            self.uid(),
+            self.gid(),
+        )?;
 
         Ok(())
     }
@@ -1423,6 +1502,40 @@ mod tests {
             let arg = vec![resource.to_string() + "=4098"];
             Env::parse_resource_limits(&mut resource_limits, &arg).unwrap();
         }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_create_dir_all_beneath_never_follows_links() {
+        let root = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let outside = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let root = root.as_path();
+        // An ordinary chain is created, and an existing one is reused.
+        create_dir_all_beneath(root, Path::new("sys/a/b")).unwrap();
+        create_dir_all_beneath(root, Path::new("sys/a/b")).unwrap();
+        assert!(root.join("sys/a/b").is_dir());
+        // A component replaced with a symlink to a host directory is refused, at any depth.
+        fs::rename(root.join("sys/a"), root.join("sys/a.old")).unwrap();
+        std::os::unix::fs::symlink(outside.as_path(), root.join("sys/a")).unwrap();
+        create_dir_all_beneath(root, Path::new("sys/a/b/c")).unwrap_err();
+        assert!(fs::read_dir(outside.as_path()).unwrap().next().is_none());
+        // So is a symlink as the final component, and names that leave the root.
+        let file = create_dir_all_beneath(root, Path::new("sys/a.old")).unwrap();
+        std::os::unix::fs::symlink(outside.as_path(), root.join("sys/a.old/link")).unwrap();
+        create_dir_all_beneath(root, Path::new("sys/a.old/link")).unwrap_err();
+        create_dir_all_beneath(root, Path::new("../escape")).unwrap_err();
+        // Files are created only once and never through a symlink.
+        let path = root.join("sys/a.old");
+        create_owned_file_with_data(&file, &path, "size", "1".into(), 0, 0)
+            .or_else(|err| match err {
+                // Unprivileged test runs cannot chown to root.
+                JailerError::ChangeFileOwner(..) => Ok(()),
+                err => Err(err),
+            })
+            .unwrap();
+        create_owned_file_with_data(&file, &path, "size", "1".into(), 0, 0).unwrap_err();
+        create_owned_file_with_data(&file, &path, "link", "1".into(), 0, 0).unwrap_err();
+        assert!(fs::read_dir(outside.as_path()).unwrap().next().is_none());
     }
 
     #[test]

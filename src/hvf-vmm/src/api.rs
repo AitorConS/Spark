@@ -260,7 +260,7 @@ fn serve_inner(socket: &Path, initial: Option<Config>, headless: bool) -> Result
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    if process.try_wait()?.is_none() && last_error.is_none() {
+                    if process.try_reap()?.is_none() && last_error.is_none() {
                         last_error = Some(
                             json!({"fault_code":"CONTROL_ERROR","fault_message":e.to_string()}),
                         );
@@ -269,7 +269,7 @@ fn serve_inner(socket: &Path, initial: Option<Config>, headless: bool) -> Result
             }
         }
         if let Some(ref mut process) = child
-            && let Some(status) = process.try_wait()?
+            && let Some(status) = process.try_reap()?
         {
             exit_code = Some(status.code().unwrap_or(1));
             let forced = operations.expects_forced_exit();
@@ -351,7 +351,11 @@ fn serve_inner(socket: &Path, initial: Option<Config>, headless: bool) -> Result
                 ("GET", "/metrics") => {
                     let mut sample = metrics.sample(
                         child.as_ref().map(|p| p.id()),
-                        child.as_ref().and_then(|p| p.4.broker_pid()),
+                        // The VMM reports the broker PID; describe it only if
+                        // it is a process of this VM, never another one.
+                        child
+                            .as_ref()
+                            .and_then(|p| p.4.broker_pid().filter(|pid| p.5.is_member(*pid))),
                         transport.connections(),
                         transport.rejected,
                     );

@@ -131,7 +131,10 @@ forwarding rules can only egress to destinations authorized in `security`;
 egress and DNS are denied by default. `"public_egress": true` authorizes TCP
 and UDP to every public IPv4 address beside the exact rules: the Internet, but
 not the host's loopback nor private (10/8, 172.16/12, 192.168/16), shared
-(100.64/10), link-local (169.254/16), multicast or reserved addresses. It
+(100.64/10), link-local (169.254/16), multicast or reserved addresses, nor
+the special-purpose blocks that are not globally reachable (192.0.0/24 used by
+464XLAT, 192.0.2/24, 192.88.99/24, 198.18/15 used by VPN and fake-IP
+interfaces, 198.51.100/24, 203.0.113/24). It
 names no resolver: `dns` still does, and may be a private address. slirp provides NAT/DHCP/DNS on
 `10.0.2.0/24` (gateway `.2`, DNS `.3`, DHCP from `.15`). The transport is behind
 `net_backend.h`, separate from VirtIO; it supports slirp and the generic
@@ -318,7 +321,11 @@ to hold one millisecond of tokens when a higher configured rate requires it.
 Network rates default to zero, meaning
 unlimited; set either `network_bytes_per_second` (1 MiB/s..1 TiB/s) or
 `network_packets_per_second` (1..1000000 packets/s) to cap that dimension
-independently. Explicit caps still use the same bounded bursts and are not
+independently. Each network cap applies separately to each direction, as
+upstream Firecracker's RX and TX rate limiters do: traffic other guests send
+to a VM spends only its receive allowance, never what its own transmissions
+need. A TSO frame costs the packets and bytes of the segments it stands for.
+Explicit caps still use the same bounded bursts and are not
 equivalent to cgroups or kernel network quotas. `--no-api` also keeps a private
 supervisor.
 
@@ -365,7 +372,15 @@ The directory contains versioned manifest, full RAM, per-CPU state
 devices, firmware, kernel/initrd and copies of all disks, including RO.
 It contains no host pointers or descriptors. It is written to a private temporary,
 files and directory are synced and published via atomic rename.
-A failure preserves the previous snapshot. The per-file size quota also
+A failure preserves the previous snapshot. The parent of `snapshot_path`
+must be owned by the user (or root) and writable by neither group nor others
+unless it is sticky, like `/private/tmp`. A group-writable directory without
+the sticky bit (mode `0775` or `0770`, as shared project directories often
+are) is refused with `snapshot parent directory must be private or sticky`:
+use `chmod g-w` or `chmod +t` on it, or capture into a directory of your own.
+Earlier builds accepted such a parent. An existing destination is replaced
+only if it is still the snapshot directory checked when the request was
+accepted, and nothing that appears there during the copy is replaced. The per-file size quota also
 limits captured RAM and disks; configure sufficient space before booting.
 
 Restore first validates schema, names, limits and compatibility;
@@ -375,6 +390,16 @@ Compatibility requires the same Mac UUID, macOS build, VMM build
 identifier and device model. The identifier derives from sources and toolchain;
 relocating or re-signing the same build does not change it. Hashes check
 integrity, they do not authenticate the creator: keep snapshots private.
+
+A snapshot resumes the guest exactly as captured, including its kernel CRNG
+state, userspace PRNGs, MAC address and any identity it generated: there is no
+entropy device, VM generation ID or restore notification on this path. Every
+load of one snapshot, and the VM that produced it if it is resumed, is a clone
+whose random output can coincide with the others until the guest reseeds. Load
+a snapshot only once, or have the guest reseed (`RNDADDENTROPY` /
+`RNDRESEEDCRNG` with fresh host entropy) and regenerate identity, keys and
+MAC-derived state after each restore, before it talks to the network. A cold
+boot gets fresh `rng-seed` and `kaslr-seed` values in `/chosen`.
 
 Restored disks are independent copies. The network backend restarts;
 applications must reconnect. For `unix-stream`, the current configuration

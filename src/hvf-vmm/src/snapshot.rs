@@ -377,6 +377,91 @@ pub(crate) fn validate_restore_network(source: &Path, restore: &serde_json::Valu
     let mut config = manifest(source)?.config;
     rebind_unix_stream(&mut config, restore)
 }
+/// Device and inode of an entry of `parent`, without following it.
+type Identity = (u64, u64);
+fn identity_at(parent: &File, name: &std::ffi::CStr) -> std::io::Result<Option<Identity>> {
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: open directory, terminated name, writable stat buffer.
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            status.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOENT) => Ok(None),
+            _ => Err(error),
+        };
+    }
+    // SAFETY: fstatat succeeded and filled the buffer.
+    let status = unsafe { status.assume_init() };
+    Ok(Some((status.st_dev as u64, status.st_ino)))
+}
+fn rename_at(
+    parent: &File,
+    from: &std::ffi::CStr,
+    to: &std::ffi::CStr,
+    flags: libc::c_uint,
+) -> std::io::Result<()> {
+    // SAFETY: terminated names relative to one open directory.
+    if unsafe {
+        libc::renameatx_np(
+            parent.as_raw_fd(),
+            from.as_ptr(),
+            parent.as_raw_fd(),
+            to.as_ptr(),
+            flags,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+/// The parent of a snapshot must not let another user rename its entries:
+/// owned by this user or root, and not writable by others unless sticky.
+/// Otherwise anyone could move a directory onto the destination while the
+/// snapshot is copied, and the supervisor would replace and delete it.
+fn private_parent(parent: &File) -> Result<()> {
+    let meta = parent.metadata()?;
+    let mode = meta.mode();
+    if (meta.uid() != unsafe { libc::geteuid() } && meta.uid() != 0)
+        || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+    {
+        return Err("snapshot parent directory must be private or sticky".into());
+    }
+    Ok(())
+}
+const DESTINATION_CHANGED: &str = "snapshot destination changed during capture";
+/// Moves the finished snapshot `staged` onto `destination`, both in `parent`.
+/// `existing` is the destination as it was checked before the copy: absent,
+/// it must still be absent (exclusive rename); present, the same directory
+/// must be there before the exchange and come out of it, or it is put back.
+/// The caller then deletes what `staged` names only after a swap verified here.
+fn install(
+    parent: &File,
+    staged: &std::ffi::CStr,
+    destination: &std::ffi::CStr,
+    existing: Option<Identity>,
+) -> Result<()> {
+    let Some(old) = existing else {
+        rename_at(parent, staged, destination, libc::RENAME_EXCL)?;
+        return Ok(());
+    };
+    if identity_at(parent, destination)? != Some(old) {
+        return Err(DESTINATION_CHANGED.into());
+    }
+    rename_at(parent, staged, destination, libc::RENAME_SWAP)?;
+    if identity_at(parent, staged)? != Some(old) {
+        rename_at(parent, staged, destination, libc::RENAME_SWAP)?;
+        return Err(DESTINATION_CHANGED.into());
+    }
+    Ok(())
+}
 /// Publish only after every component and the manifest have been fsynced.
 pub(crate) fn publish(
     value: serde_json::Value,
@@ -393,9 +478,24 @@ pub(crate) fn publish(
     let parent = fs::canonicalize(parent)?;
     let name = destination.file_name().ok_or("invalid snapshot name")?;
     let destination = parent.join(name);
-    if fs::symlink_metadata(&destination).is_ok() {
-        let _ = manifest(&destination)?;
-    }
+    let parent_directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&parent)?;
+    private_parent(&parent_directory)?;
+    let target = std::ffi::CString::new(name.as_bytes())?;
+    // What is at the destination now is what may be replaced; nothing that
+    // appears there later is.
+    let existing = match identity_at(&parent_directory, &target)? {
+        None => None,
+        Some(identity) => {
+            let _ = manifest(&destination)?;
+            if identity_at(&parent_directory, &target)? != Some(identity) {
+                return Err(DESTINATION_CHANGED.into());
+            }
+            Some(identity)
+        }
+    };
     let temporary = tempfile::Builder::new()
         .prefix(".hvf-snapshot-")
         .tempdir_in(&parent)?;
@@ -427,42 +527,20 @@ pub(crate) fn publish(
     out.sync_all()?;
     File::open(temporary.path())?.sync_all()?;
     cancelled(cancel)?;
-    if fs::symlink_metadata(&destination).is_ok() {
-        use std::os::unix::ffi::OsStrExt;
-        let from = std::ffi::CString::new(temporary.path().as_os_str().as_bytes())?;
-        let to = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
-        // SAFETY: live terminated paths. Atomic exchange preserves the old snapshot on failure.
-        if unsafe {
-            libc::renameatx_np(
-                libc::AT_FDCWD,
-                from.as_ptr(),
-                libc::AT_FDCWD,
-                to.as_ptr(),
-                libc::RENAME_SWAP,
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    } else {
-        let from = std::ffi::CString::new(temporary.path().as_os_str().as_bytes())?;
-        let to = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
-        // SAFETY: terminated paths, exclusive rename never replaces an intervening entry.
-        if unsafe {
-            libc::renameatx_np(
-                libc::AT_FDCWD,
-                from.as_ptr(),
-                libc::AT_FDCWD,
-                to.as_ptr(),
-                libc::RENAME_EXCL,
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
+    let staged = std::ffi::CString::new(
+        temporary
+            .path()
+            .file_name()
+            .ok_or("invalid temporary snapshot name")?
+            .as_bytes(),
+    )?;
+    install(&parent_directory, &staged, &target, existing)?;
+    // After an exchange the temporary name holds the verified old snapshot,
+    // which TempDir removes; after an exclusive rename it names nothing.
+    if existing.is_none() {
         let _ = temporary.keep();
     }
-    File::open(parent)?.sync_all()?;
+    parent_directory.sync_all()?;
     Ok(())
 }
 /// Validate first; copy and hash each opened component into private storage before use.
@@ -610,6 +688,62 @@ mod tests {
         assert!(copy_hash(&source, None, 4, &AtomicBool::new(true)).is_err());
         std::os::unix::fs::symlink(&source, &target).unwrap();
         assert!(copy_hash(&target, None, 4, &AtomicBool::new(false)).is_err());
+    }
+
+    #[test]
+    fn install_replaces_only_the_checked_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = File::open(root.path()).unwrap();
+        let name = |n: &str| std::ffi::CString::new(n).unwrap();
+        let (staged, destination) = (name("staged"), name("snapshot"));
+        let marker = |dir: &str| root.path().join(dir).join("marker");
+        let reset = |dirs: &[&str]| {
+            for dir in ["staged", "snapshot", "moved"] {
+                let _ = fs::remove_dir_all(root.path().join(dir));
+            }
+            for dir in dirs {
+                fs::create_dir(root.path().join(dir)).unwrap();
+                fs::write(marker(dir), dir).unwrap();
+            }
+        };
+        // Absent when checked, present now: refused, nothing replaced.
+        reset(&["staged", "snapshot"]);
+        assert!(install(&parent, &staged, &destination, None).is_err());
+        assert_eq!(fs::read(marker("snapshot")).unwrap(), b"snapshot");
+        // Present when checked, then another directory moved there: refused.
+        reset(&["staged", "snapshot"]);
+        let checked = identity_at(&parent, &destination).unwrap();
+        fs::rename(root.path().join("snapshot"), root.path().join("moved")).unwrap();
+        fs::create_dir(root.path().join("snapshot")).unwrap();
+        fs::write(marker("snapshot"), "other").unwrap();
+        let error = install(&parent, &staged, &destination, checked).unwrap_err();
+        assert_eq!(error.to_string(), DESTINATION_CHANGED);
+        assert_eq!(fs::read(marker("snapshot")).unwrap(), b"other");
+        assert_eq!(fs::read(marker("staged")).unwrap(), b"staged");
+        // The checked directory is exchanged, and comes out under the staged name.
+        reset(&["staged", "snapshot"]);
+        let checked = identity_at(&parent, &destination).unwrap();
+        install(&parent, &staged, &destination, checked).unwrap();
+        assert_eq!(fs::read(marker("snapshot")).unwrap(), b"staged");
+        assert_eq!(fs::read(marker("staged")).unwrap(), b"snapshot");
+        // Absent when checked and still absent: moved into place.
+        reset(&["staged"]);
+        install(&parent, &staged, &destination, None).unwrap();
+        assert_eq!(fs::read(marker("snapshot")).unwrap(), b"staged");
+    }
+    #[test]
+    fn snapshot_parent_must_be_private_or_sticky() {
+        let root = tempfile::tempdir().unwrap();
+        let check = |mode: u32| {
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(mode)).unwrap();
+            private_parent(&File::open(root.path()).unwrap()).is_ok()
+        };
+        assert!(check(0o700));
+        assert!(check(0o755));
+        assert!(!check(0o777));
+        assert!(!check(0o770));
+        assert!(check(0o1777));
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     fn stream_config(path: &str, mac: &str) -> Config {

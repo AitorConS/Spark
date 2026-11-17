@@ -35,6 +35,10 @@ def main():
             else:
                 with urllib.request.urlopen(source['url'], timeout=60) as response, temporary.open('wb') as out:
                     shutil.copyfileobj(response, out)
+            # Only a verified file takes its final name in the cache.
+            if hashlib.sha256(temporary.read_bytes()).hexdigest() != source['sha256']:
+                temporary.unlink()
+                raise SystemExit(f'Checksum mismatch: {target}')
             temporary.replace(target)
         if hashlib.sha256(target.read_bytes()).hexdigest() != source['sha256']:
             raise SystemExit(f'Checksum mismatch: {target}')
@@ -42,7 +46,9 @@ def main():
     if not source.exists():
         with tarfile.open(cache / 'glib-2.88.3.tar.xz') as archive:
             # Source archive is authenticated above, never a guest-provided archive.
-            archive.extractall(BASE)
+            # The data filter (Python 3.12+) also keeps a future lock update from
+            # writing outside BASE.
+            archive.extractall(BASE, **({'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}))
     wraps = source / 'subprojects/packagecache'
     wraps.mkdir(exist_ok=True)
     for name in locked:

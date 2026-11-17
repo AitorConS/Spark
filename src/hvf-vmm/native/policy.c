@@ -23,13 +23,20 @@ static int match(const struct hvf_endpoint *rules,unsigned count,int type,const 
     return 0;
 }
 // Public means routable on the Internet: not this host, not a private,
-// shared (CGNAT) or link-local network, not multicast or reserved space.
-// public_egress grants these and nothing nearer, so a guest reaches the
-// Internet without reaching the host's loopback or the LAN around it.
+// shared (CGNAT) or link-local network, not multicast or reserved space, and
+// none of the IANA special-purpose blocks that are not globally reachable
+// (RFC 6890): IETF protocol assignments (192.0.0/24, where 464XLAT/CLAT puts
+// its local addresses), the documentation TEST-NETs, the deprecated 6to4
+// relay anycast and the benchmarking 198.18/15 that VPN and fake-IP
+// interfaces use locally. public_egress grants these and nothing nearer, so a
+// guest reaches the Internet without reaching the host's loopback or the LAN
+// around it.
 int hvf_policy_public(const struct in_addr *address){
     static const struct {uint32_t net;unsigned bits;} closed[]={
         {0x00000000,8},{0x0a000000,8},{0x64400000,10},{0x7f000000,8},
         {0xa9fe0000,16},{0xac100000,12},{0xc0a80000,16},{0xe0000000,3},
+        {0xc0000000,24},{0xc0000200,24},{0xc0586300,24},{0xc6120000,15},
+        {0xc6336400,24},{0xcb007100,24},
     };
     uint32_t value=ntohl(address->s_addr);
     for(unsigned i=0;i<sizeof(closed)/sizeof(closed[0]);i++)

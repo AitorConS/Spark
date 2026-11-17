@@ -14,6 +14,8 @@ OEM payloads, including Mellanox-specific fields. The permanent corpus
 It builds the source mask of ICMP errors from an unsigned constant: `0xf << 28`
 overflows a signed int, which UBSan reports although compilers produce the
 intended mask. The permanent corpus `icmp-error-source-mask` reproduces it.
+It drops an ICMP echo whose reassembled length would wrap the 16-bit `ip_len`
+once the header is added back, which made the reply skip fragmentation.
 `libslirp-version.h` is derived from the upstream template with the version pinned
 in `libslirp.json` and is checked into Git so that direct builds do not depend
 on a prior Meson configuration. When updating libslirp, also update

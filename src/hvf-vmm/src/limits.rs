@@ -128,7 +128,155 @@ pub(crate) fn process(pid: u32) -> Option<libc::proc_taskinfo> {
         None
     }
 }
+/// A process of the VM, identified across PID reuse by its start time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Member {
+    pub pid: i32,
+    pub start: (u64, u64),
+}
+/// What the supervisor can learn about host processes.
+pub(crate) trait Processes {
+    /// PIDs in process group `pgid`; None when enumeration failed.
+    fn group(&self, pgid: i32) -> Option<Vec<i32>>;
+    /// PIDs whose parent is `pid`; None when enumeration failed.
+    fn children(&self, pid: i32) -> Option<Vec<i32>>;
+    /// Start time of a live process.
+    fn start(&self, pid: i32) -> Option<(u64, u64)>;
+}
+/// More than the VMM, broker and authority could ever be.
+const MAX_MEMBERS: usize = 64;
+/// The VM's processes. Group membership alone is not enough: a member can
+/// leave the leader's group with setpgid. So the set also holds every
+/// descendant of the leader and of the group (a process cannot change its
+/// parent), and every member seen before that is still the same process (one
+/// whose parent exited, reparenting it). None when enumeration failed.
+pub(crate) fn members(
+    table: &impl Processes,
+    leader: i32,
+    known: &std::collections::BTreeSet<Member>,
+) -> Option<std::collections::BTreeSet<Member>> {
+    let mut queue = table.group(leader)?;
+    queue.push(leader);
+    queue.extend(
+        known
+            .iter()
+            .filter(|m| table.start(m.pid) == Some(m.start))
+            .map(|m| m.pid),
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    let mut found = std::collections::BTreeSet::new();
+    while let Some(pid) = queue.pop() {
+        if pid <= 0 || !seen.insert(pid) {
+            continue;
+        }
+        if seen.len() > MAX_MEMBERS {
+            return None;
+        }
+        let Some(start) = table.start(pid) else {
+            continue;
+        };
+        found.insert(Member { pid, start });
+        queue.extend(table.children(pid)?);
+    }
+    Some(found)
+}
+/// Where a kill stops looking: far more processes than a host allows a user.
+const MAX_SWEEP: usize = 1 << 16;
+/// Calls `signal` for every process of the VM other than the leader, as the
+/// walk reaches it. Unlike `members` it has no use for a complete answer, so
+/// nothing makes it give up: a VM with more than MAX_MEMBERS processes, or a
+/// listing that fails, still has every process the walk does reach signalled.
+/// A process's children are listed before it is signalled, while it is still
+/// their parent, and a known member is signalled only if it is still the
+/// process recorded, never a reused PID.
+pub(crate) fn sweep(
+    table: &impl Processes,
+    leader: i32,
+    known: &std::collections::BTreeSet<Member>,
+    mut signal: impl FnMut(i32),
+) {
+    let mut queue = table.group(leader).unwrap_or_default();
+    queue.push(leader);
+    queue.extend(
+        known
+            .iter()
+            .filter(|m| table.start(m.pid) == Some(m.start))
+            .map(|m| m.pid),
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(pid) = queue.pop() {
+        if pid <= 0 || !seen.insert(pid) {
+            continue;
+        }
+        if seen.len() > MAX_SWEEP {
+            return;
+        }
+        queue.extend(table.children(pid).unwrap_or_default());
+        if pid != leader && table.start(pid).is_some() {
+            signal(pid);
+        }
+    }
+}
+/// The host's process table, through libproc.
+pub(crate) struct Darwin;
+impl Darwin {
+    fn list(kind: u32, argument: i32) -> Option<Vec<i32>> {
+        // A listing that fills the buffer may be cut short: ask again with
+        // more room, so that a parent with many children is listed whole.
+        let mut pids = vec![0i32; MAX_MEMBERS];
+        loop {
+            let size = i32::try_from(std::mem::size_of_val(pids.as_slice())).ok()?;
+            // SAFETY: writable buffer of `size` bytes; libproc fills at most that.
+            let n = unsafe {
+                libc::proc_listpids(kind, argument as u32, pids.as_mut_ptr().cast(), size)
+            };
+            if n < 0 || n > size || n % 4 != 0 {
+                return None;
+            }
+            if n < size {
+                pids.truncate(n as usize / 4);
+                pids.retain(|&p| p > 0);
+                return Some(pids);
+            }
+            if pids.len() >= MAX_SWEEP {
+                return None;
+            }
+            pids = vec![0i32; pids.len() * 4];
+        }
+    }
+}
+impl Processes for Darwin {
+    fn group(&self, pgid: i32) -> Option<Vec<i32>> {
+        // PROC_PGRP_ONLY=2 is the public macOS 26 sys/proc_info.h selector.
+        Self::list(2, pgid)
+    }
+    fn children(&self, pid: i32) -> Option<Vec<i32>> {
+        // PROC_PPID_ONLY=6, from the same header.
+        Self::list(6, pid)
+    }
+    fn start(&self, pid: i32) -> Option<(u64, u64)> {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        // SAFETY: writable buffer, initialized only when libproc returns its full size.
+        if unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        } != size
+        {
+            return None;
+        }
+        let info = unsafe { info.assume_init() };
+        (info.pbi_pid == pid as u32).then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+    }
+}
 pub(crate) struct Watchdog {
+    /// Every process of the VM seen so far: see `members`.
+    members: std::collections::BTreeSet<Member>,
     next: Instant,
     budget: u64,
     cpu_budget: u64,
@@ -148,6 +296,7 @@ impl Watchdog {
             .rss_mib
             .unwrap_or_else(|| (2 * u64::from(memory_mib) + 1024).max(DEFAULT_RSS_FLOOR_MIB));
         Self {
+            members: Default::default(),
             next: Instant::now(),
             budget: rss_mib << 20,
             cpu_budget: limits.cpu_seconds * 1_000_000_000,
@@ -157,23 +306,46 @@ impl Watchdog {
             samples: 0,
         }
     }
+    /// Refreshes the record of the VM's processes. The supervisor holds an
+    /// unreaped leader Child while calling this.
+    fn track(&mut self, leader: u32) -> bool {
+        match members(&Darwin, leader as i32, &self.members) {
+            Some(members) => {
+                self.members = members;
+                true
+            }
+            None => false,
+        }
+    }
+    /// SIGKILL to every process of the VM other than the leader, including
+    /// any that left its process group, however many there are: see `sweep`.
+    /// A recorded member is checked against its start time first, so a reused
+    /// PID is never signalled.
+    pub fn kill_members(&mut self, leader: u32) {
+        sweep(&Darwin, leader as i32, &self.members, |pid| {
+            // SAFETY: plain signal to a process the walk just found to be the
+            // VM's: in its group, a descendant, or the recorded member.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        });
+    }
+    /// Whether `pid` is a process of the VM as last recorded. Telemetry from
+    /// the VMM (such as the broker PID it reports) is checked against this.
+    pub fn is_member(&self, pid: u32) -> bool {
+        self.members.iter().any(|m| m.pid == pid as i32)
+    }
     // The supervisor holds an unreaped group leader Child while calling this.
-    // Kernel group enumeration includes broker and authority; telemetry is untrusted.
+    // Kernel enumeration finds broker and authority; telemetry is untrusted.
     pub fn poll(&mut self, leader: u32) -> Option<String> {
         if Instant::now() < self.next {
             return None;
         }
         self.next = Instant::now() + Duration::from_millis(100);
-        let mut pids = [0i32; 32];
-        let size = std::mem::size_of_val(&pids) as i32;
-        // PROC_PGRP_ONLY=2 is the public macOS 26 sys/proc_info.h selector.
-        let n = unsafe { libc::proc_listpids(2, leader, pids.as_mut_ptr().cast(), size) };
-        if n < 0 || n >= size || n % 4 != 0 {
+        if !self.track(leader) {
             return Some(
-                "RESOURCE_MONITOR_UNAVAILABLE: process group enumeration failed or overflowed"
-                    .into(),
+                "RESOURCE_MONITOR_UNAVAILABLE: process enumeration failed or overflowed".into(),
             );
         }
+        let pids: Vec<i32> = self.members.iter().map(|m| m.pid).collect();
         let mut rss = 0u64;
         let mut ticks = std::collections::BTreeMap::new();
         let mut delta = 0u64;
@@ -181,10 +353,7 @@ impl Watchdog {
         if unsafe { mach_timebase_info(&mut timebase) } != 0 || timebase.denom == 0 {
             return Some("RESOURCE_MONITOR_UNAVAILABLE: clock conversion failed".into());
         }
-        for &pid in &pids[..n as usize / 4] {
-            if pid <= 0 {
-                continue;
-            }
+        for &pid in &pids {
             if let Some(info) = process(pid as u32) {
                 rss = rss.saturating_add(info.pti_resident_size);
                 let current = info.pti_total_user.saturating_add(info.pti_total_system);
@@ -257,6 +426,130 @@ mod tests {
         assert_eq!(Watchdog::new(&explicit, 8192).budget, 64 << 20);
     }
 
+    /// A process table for `members`: pid -> (parent, group, start).
+    struct Table(std::collections::BTreeMap<i32, (i32, i32, u64)>);
+    impl Processes for Table {
+        fn group(&self, pgid: i32) -> Option<Vec<i32>> {
+            Some(
+                self.0
+                    .iter()
+                    .filter(|e| e.1.1 == pgid)
+                    .map(|e| *e.0)
+                    .collect(),
+            )
+        }
+        fn children(&self, pid: i32) -> Option<Vec<i32>> {
+            Some(
+                self.0
+                    .iter()
+                    .filter(|e| e.1.0 == pid)
+                    .map(|e| *e.0)
+                    .collect(),
+            )
+        }
+        fn start(&self, pid: i32) -> Option<(u64, u64)> {
+            self.0.get(&pid).map(|e| (e.2, 0))
+        }
+    }
+    fn pids(set: &std::collections::BTreeSet<Member>) -> Vec<i32> {
+        set.iter().map(|m| m.pid).collect()
+    }
+    #[test]
+    fn members_survive_leaving_the_group() {
+        // Leader 10 (group 10), broker 11 and authority 12; 99 is unrelated.
+        let mut table = Table(
+            [
+                (10, (1, 10, 5)),
+                (11, (10, 10, 6)),
+                (12, (11, 10, 7)),
+                (99, (1, 99, 8)),
+            ]
+            .into(),
+        );
+        let known = members(&table, 10, &Default::default()).unwrap();
+        assert_eq!(pids(&known), [10, 11, 12]);
+        // The broker leaves the group: still the leader's child.
+        table.0.insert(11, (10, 11, 6));
+        let known = members(&table, 10, &known).unwrap();
+        assert_eq!(pids(&known), [10, 11, 12]);
+        // Then its parent dies and it is reparented: still recorded.
+        table.0.remove(&10);
+        table.0.insert(11, (1, 11, 6));
+        table.0.insert(12, (11, 11, 7));
+        let known = members(&table, 10, &known).unwrap();
+        assert_eq!(pids(&known), [11, 12]);
+        // A reused PID is a different process and is dropped.
+        table.0.insert(12, (1, 12, 50));
+        table.0.insert(11, (1, 11, 51));
+        assert!(members(&table, 10, &known).unwrap().is_empty());
+    }
+    #[test]
+    fn members_overflow_is_an_error() {
+        let table = Table(
+            (10..10 + MAX_MEMBERS as i32 + 1)
+                .map(|p| (p, (if p == 10 { 1 } else { p - 1 }, 10, 1)))
+                .collect(),
+        );
+        assert!(members(&table, 10, &Default::default()).is_none());
+    }
+
+    #[test]
+    fn sweep_signals_past_the_member_limit() {
+        // The leader, a broker that left the group, and more children of the
+        // broker (in a group of their own) than `members` accepts.
+        let count = 3 * MAX_MEMBERS as i32;
+        let mut table = Table([(10, (1, 10, 1)), (11, (10, 11, 2)), (99, (1, 99, 3))].into());
+        table.0.extend((100..100 + count).map(|p| (p, (11, 11, 4))));
+        let known = Default::default();
+        assert!(members(&table, 10, &known).is_none());
+        let mut signalled = Vec::new();
+        sweep(&table, 10, &known, |pid| signalled.push(pid));
+        signalled.sort_unstable();
+        let expected: Vec<i32> = std::iter::once(11).chain(100..100 + count).collect();
+        assert_eq!(signalled, expected);
+    }
+    #[test]
+    fn sweep_signals_recorded_members_but_not_reused_pids() {
+        // 11 was recorded, then reparented outside the group; 12 was recorded
+        // and its PID now belongs to another process.
+        let table = Table([(10, (1, 10, 1)), (11, (1, 11, 2)), (12, (1, 12, 9))].into());
+        let known = [
+            Member {
+                pid: 11,
+                start: (2, 0),
+            },
+            Member {
+                pid: 12,
+                start: (3, 0),
+            },
+        ]
+        .into();
+        let mut signalled = Vec::new();
+        sweep(&table, 10, &known, |pid| signalled.push(pid));
+        assert_eq!(signalled, [11]);
+    }
+    #[test]
+    fn darwin_lists_more_children_than_the_member_limit() {
+        // Real processes: this test's own children, more than one buffer.
+        let count = MAX_MEMBERS + 6;
+        let mut children: Vec<_> = (0..count)
+            .map(|_| {
+                std::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let listed = Darwin.children(std::process::id() as i32);
+        for child in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let listed = listed.unwrap();
+        for child in &children {
+            assert!(listed.contains(&(child.id() as i32)));
+        }
+    }
     #[test]
     fn default_disk_budget_is_above_benchmark_scale() {
         let limits = Limits::default();

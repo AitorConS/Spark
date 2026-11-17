@@ -19,6 +19,11 @@ ssize_t hvf_policy_sendto(int,const void *,size_t,int,const struct sockaddr *,so
 int hvf_policy_close(int);
 int hvf_policy_dns(struct in_addr *,uint16_t *);
 ssize_t hvf_policy_recvfrom(int,void *,size_t,int,struct sockaddr *,socklen_t *);
+// A call the broker profile must refuse; prints the errno for the log.
+static void refused(const char *what,int result){
+    if(result>=0){fprintf(stderr,"broker profile allowed %s\n",what);_exit(20);}
+    fprintf(stderr,"broker profile refused %s: %s\n",what,strerror(errno));
+}
 static struct sockaddr_in address(unsigned port){struct sockaddr_in a={.sin_len=sizeof(a),.sin_family=AF_INET,.sin_port=htons(port)};a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);return a;}
 int main(int argc,char **argv){
     unsigned stress=argc==2 && !strcmp(argv[1],"--udp-stress")?32:0;
@@ -60,6 +65,27 @@ int main(int argc,char **argv){
     struct pollfd ready={client,POLLOUT,0};assert(poll(&ready,1,1000)==1);
     assert(write(client,"t",1)==1);char byte;
     int raw=socket(AF_INET,SOCK_STREAM,0);assert(raw>=0);assert(connect(raw,(void *)&t,sizeof(t))<0&&errno==EPERM);close(raw);
+    // The broker creates real AF_INET sockets (policy.c) that the authority's
+    // sockets later replace; only this profile stands between such a socket
+    // and host IPv4 if broker code calls the system directly. Every way out
+    // must be refused, to loopback and to a non-loopback (TEST-NET-1) address.
+    struct sockaddr_in lan=t;lan.sin_addr.s_addr=htonl(0xc0000201);
+    const struct sockaddr_in *targets[2]={&t,&lan};
+    for(unsigned i=0;i<2;i++){
+        const struct sockaddr *to=(const void *)targets[i];
+        int stream=socket(AF_INET,SOCK_STREAM,0),datagram=socket(AF_INET,SOCK_DGRAM,0);
+        if(stream<0||datagram<0){refused("socket(AF_INET)",-1);if(stream>=0)close(stream);if(datagram>=0)close(datagram);continue;}
+        refused("connect",connect(stream,to,sizeof(t)));
+        sa_endpoints_t endpoints={.sae_dstaddr=to,.sae_dstaddrlen=sizeof(t)};
+        int sx=socket(AF_INET,SOCK_STREAM,0);assert(sx>=0);
+        refused("connectx",connectx(sx,&endpoints,SAE_ASSOCID_ANY,0,NULL,0,NULL,NULL));close(sx);
+        struct sockaddr_in local=*targets[i];local.sin_port=0;
+        refused("bind",bind(datagram,(void *)&local,sizeof(local)));
+        refused("listen",listen(stream,1));
+        refused("sendto",(int)sendto(datagram,"x",1,0,to,sizeof(t)));
+        refused("connect (UDP)",connect(datagram,to,sizeof(t)));
+        close(stream);close(datagram);
+    }
     int proxy=hvf_policy_socket(AF_INET,SOCK_DGRAM,0);assert(proxy>=0);
     assert(hvf_policy_sendto(proxy,"u",1,0,(void *)&u,sizeof(u))==1);
     ready=(struct pollfd){proxy,POLLIN,0};assert(poll(&ready,1,1000)==1);

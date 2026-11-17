@@ -63,7 +63,8 @@ static int link_message(int fd,uint8_t kind,uint64_t generation,int descriptor){
 }
 // Returns 1 with a message (and *descriptor, or -1), 0 when none is queued.
 static int link_receive(int fd,uint8_t *kind,uint64_t *generation,int *descriptor){
-    for(;;){
+    // Bounded: a flood of invalid datagrams must not keep the device loop here.
+    for(unsigned budget=0;budget<64;budget++){
         uint8_t wire[LINK_MESSAGE+1];char space[CMSG_SPACE(sizeof(int))];
         struct iovec io={wire,sizeof(wire)};
         struct msghdr h={.msg_iov=&io,.msg_iovlen=1,.msg_control=space,.msg_controllen=sizeof(space)};
@@ -83,6 +84,7 @@ static int link_receive(int fd,uint8_t *kind,uint64_t *generation,int *descripto
         for(unsigned i=0;i<8;i++)*generation|=(uint64_t)wire[8+i]<<(8*i);
         return 1;
     }
+    return 0;
 }
 static void fail(const char *message){fprintf(stderr,"network IPC: %s\n",message);exit(2);}
 static ssize_t broker_deliver(const void *data,size_t size,void *opaque){
@@ -104,6 +106,10 @@ static void broker_main(const struct hvf_options *options){
     if(net_forget_guest_memory())_exit(2);
     if(options->cpu_seconds){struct rlimit limit={options->cpu_seconds,options->cpu_seconds};if(setrlimit(RLIMIT_CPU,&limit))_exit(2); }
     signal(SIGTERM,SIG_DFL);signal(SIGINT,SIG_DFL);
+    // A write to a peer-closed socket (slirp's host TCP sockets) must fail with
+    // EPIPE, not end the broker: set it here rather than rely on what the Rust
+    // runtime of the forked VMM happened to leave.
+    signal(SIGPIPE,SIG_IGN);
     // Retain only IPC, stderr, and the inherited workspace lease. No disk FDs.
     const char *lease_env=getenv("HVF_LEASE_FD");
     int lease=lease_env?atoi(lease_env):-1;
@@ -270,12 +276,12 @@ int net_backend_send(const void *data,size_t size){
 static void link_service(void){
     if(link_channel<0)return;
     uint8_t kind;uint64_t generation;int descriptor;
-    while(link_receive(link_channel,&kind,&generation,&descriptor)){
+    for(unsigned budget=0;budget<16&&link_receive(link_channel,&kind,&generation,&descriptor);budget++){
         if(kind!=LINK_OFFER||descriptor<0||generation<=link_generation){if(descriptor>=0)close(descriptor);continue;}
         if(fcntl(descriptor,F_SETFD,FD_CLOEXEC)){close(descriptor);continue;}
         if(stream.fd>=0)close(stream.fd);
         int paused=stream.paused;
-        stream.fd=descriptor;stream.connecting=0;stream.used=0;stream.need=4;stream.rx_start=stream.rx_used=0;
+        stream.fd=descriptor;stream.connecting=0;stream.used=0;stream.need=4;stream.rx_start=stream.rx_used=0;stream.frames_in=0;
         stream.queued=stream.sent=stream.tx_head=0;stream.progress=stream.tx_progress=stream_ms();stream.paused=paused;
         if(!link_generation)fprintf(stderr,"network: direct link to the switch\n");
         link_generation=generation;link_lost=0;link_partial_polls=0;
