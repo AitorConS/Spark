@@ -58,9 +58,23 @@ fn lock(file: &File) -> bool {
     // SAFETY: flock only refers to the open file descriptor and uses no pointers.
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
+fn share(file: &File) -> bool {
+    // SAFETY: as in lock.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) == 0 }
+}
+/// A workspace is in use while anyone holds a shared lock on its lease, and
+/// recovery takes it only with an exclusive one. The supervisor and its VMMs
+/// hold separate shared locks on separate open file descriptions: the
+/// supervisor's read-write one, with the marker, never leaves it; children
+/// get a read-only one. A confined child can therefore release only its own
+/// lock, never the supervisor's, and cannot rewrite the marker, while a dead
+/// supervisor's directory still stays locked until its last VMM exits.
 pub(super) struct Workspace {
     directory: tempfile::TempDir,
+    /// Held for its lock and the marker; only tests read it.
+    #[allow(dead_code)]
     lease: File,
+    child_lease: File,
 }
 impl Workspace {
     pub fn new() -> Result<Self> {
@@ -74,7 +88,7 @@ impl Workspace {
             .create_new(true)
             .mode(0o600)
             .open(directory.path().join(".lease"))?;
-        if !lock(&lease) {
+        if !share(&lease) {
             return Err("cannot acquire supervisor workspace lease".into());
         }
         let marker = Marker {
@@ -95,15 +109,28 @@ impl Workspace {
         if unsafe { libc::fsync(lease.as_raw_fd()) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        Ok(Self { directory, lease })
+        let child_lease = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(directory.path().join(".lease"))?;
+        let (ours, theirs) = (lease.metadata()?, child_lease.metadata()?);
+        if ours.dev() != theirs.dev() || ours.ino() != theirs.ino() || !share(&child_lease) {
+            return Err("cannot share supervisor workspace lease".into());
+        }
+        Ok(Self {
+            directory,
+            lease,
+            child_lease,
+        })
     }
     pub fn path(&self) -> &Path {
         self.directory.path()
     }
-    // Every VMM inherits this same open-file-description lock through exec.
-    // A dead supervisor's directory remains locked until its final VMM exits.
+    // Every VMM inherits this read-only description, and its shared lock,
+    // through exec. A dead supervisor's directory remains locked until its
+    // final VMM exits.
     pub fn lease_fd(&self) -> RawFd {
-        self.lease.as_raw_fd()
+        self.child_lease.as_raw_fd()
     }
 }
 fn recover(root: &Path) -> Result<()> {
@@ -167,6 +194,34 @@ mod tests {
         let malformed = tempfile::Builder::new().prefix(PREFIX).tempdir().unwrap();
         let _ = recover_one(malformed.path());
         assert!(malformed.path().exists());
+    }
+    #[test]
+    fn children_cannot_release_or_rewrite_the_lease() {
+        let workspace = Workspace::new().unwrap();
+        let fd = workspace.lease_fd();
+        let marker = fs::read(workspace.path().join(".lease")).unwrap();
+        // What a confined child can do with the descriptor it inherits.
+        // SAFETY: plain calls on an open descriptor and a valid buffer.
+        unsafe {
+            assert_eq!(libc::pwrite(fd, b"{}".as_ptr().cast(), 2, 0), -1);
+            assert_eq!(libc::ftruncate(fd, 0), -1);
+            assert_eq!(libc::flock(fd, libc::LOCK_UN), 0);
+        }
+        assert_eq!(fs::read(workspace.path().join(".lease")).unwrap(), marker);
+        // The supervisor's own lock still keeps recovery out.
+        let other = File::open(workspace.path().join(".lease")).unwrap();
+        assert!(!lock(&other));
+        recover_one(workspace.path()).unwrap();
+        assert!(workspace.path().exists());
+    }
+    #[test]
+    fn a_child_keeps_a_dead_supervisors_workspace() {
+        let workspace = Workspace::new().unwrap();
+        // The supervisor's description goes away; the child's is still open.
+        // SAFETY: the supervisor's lock alone is released; the File stays valid.
+        unsafe { libc::flock(workspace.lease.as_raw_fd(), libc::LOCK_UN) };
+        let other = File::open(workspace.path().join(".lease")).unwrap();
+        assert!(!lock(&other));
     }
     #[test]
     fn distinguishes_reused_pid_and_rejects_live_identity() {
