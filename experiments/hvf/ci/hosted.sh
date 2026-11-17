@@ -11,6 +11,7 @@ export RUSTUP_TOOLCHAIN=1.97.0
 export MACOSX_DEPLOYMENT_TARGET=26.0
 export SDKROOT="${SDKROOT:-$(xcrun --show-sdk-path)}"
 export FUZZ_CC="${FUZZ_CC:-$(brew --prefix llvm)/bin/clang}"
+python3 experiments/hvf/ci/check-workflows.py
 sh experiments/hvf/build-native.sh
 cargo test --locked -p hvf-vmm --target aarch64-apple-darwin
 cargo clippy --locked -p hvf-vmm -p firecracker --target aarch64-apple-darwin -- -D warnings
