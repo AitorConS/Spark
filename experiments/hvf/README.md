@@ -131,7 +131,10 @@ forwarding rules can only egress to destinations authorized in `security`;
 egress and DNS are denied by default. `"public_egress": true` authorizes TCP
 and UDP to every public IPv4 address beside the exact rules: the Internet, but
 not the host's loopback nor private (10/8, 172.16/12, 192.168/16), shared
-(100.64/10), link-local (169.254/16), multicast or reserved addresses. It
+(100.64/10), link-local (169.254/16), multicast or reserved addresses, nor
+the special-purpose blocks that are not globally reachable (192.0.0/24 used by
+464XLAT, 192.0.2/24, 192.88.99/24, 198.18/15 used by VPN and fake-IP
+interfaces, 198.51.100/24, 203.0.113/24). It
 names no resolver: `dns` still does, and may be a private address. slirp provides NAT/DHCP/DNS on
 `10.0.2.0/24` (gateway `.2`, DNS `.3`, DHCP from `.15`). The transport is behind
 `net_backend.h`, separate from VirtIO; it supports slirp and the generic
