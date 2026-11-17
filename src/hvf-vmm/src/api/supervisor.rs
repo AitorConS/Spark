@@ -125,16 +125,27 @@ impl Guest {
     pub fn cap_log(&self) {
         let _ = cap_log(&self.1.path().join("startup.log"));
     }
+    /// Kills every process of the VM: its process group, the leader itself
+    /// and any recorded member that left the group (see limits::members).
     /// Callers must not have reaped the leader: see `try_reap`.
     pub fn kill_group(&mut self) -> std::io::Result<()> {
+        let leader = self.0.id();
+        // A member that left the group is found by descent before the group
+        // is killed, while its parent still exists.
+        self.5.kill_members(leader);
         // The leader is owned and unreaped, preventing reuse of its group ID.
-        if unsafe { libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL) } != 0 {
+        let mut result = Ok(());
+        if unsafe { libc::kill(-(leader as libc::pid_t), libc::SIGKILL) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error);
+                result = Err(error);
             }
         }
-        Ok(())
+        // The leader too, should it have left its own group: its PID is ours
+        // until it is reaped, and Drop waits for it.
+        // SAFETY: plain signal to an unreaped child.
+        unsafe { libc::kill(leader as libc::pid_t, libc::SIGKILL) };
+        result
     }
     /// The leader's state, without reaping it. An exited but unreaped leader
     /// still holds its PID, and with it the process group ID.
