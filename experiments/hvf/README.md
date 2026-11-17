@@ -318,7 +318,11 @@ to hold one millisecond of tokens when a higher configured rate requires it.
 Network rates default to zero, meaning
 unlimited; set either `network_bytes_per_second` (1 MiB/s..1 TiB/s) or
 `network_packets_per_second` (1..1000000 packets/s) to cap that dimension
-independently. Explicit caps still use the same bounded bursts and are not
+independently. Each network cap applies separately to each direction, as
+upstream Firecracker's RX and TX rate limiters do: traffic other guests send
+to a VM spends only its receive allowance, never what its own transmissions
+need.
+Explicit caps still use the same bounded bursts and are not
 equivalent to cgroups or kernel network quotas. `--no-api` also keeps a private
 supervisor.
 

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "net.h"
 #include "budget.h"
-static struct budget network_budget;
+// Each direction has its own allowance at the configured rates, as upstream
+// Firecracker's RX and TX rate limiters do: frames other guests send to this
+// VM can exhaust only its receive allowance, never its own transmit path.
+static struct budget rx_budget,tx_budget;
 #include <Hypervisor/Hypervisor.h>
 #include "net_backend.h"
 #include "net_peer.h"
@@ -201,7 +204,7 @@ static ssize_t receive(const void *buf,size_t len,void *opaque){
             errno=EAGAIN;return -1;
         }
         segment_since=0;
-        if(!budget_take(&network_budget,len,(unsigned)count)){errno=EAGAIN;return -1;}
+        if(!budget_take(&rx_budget,len,(unsigned)count)){errno=EAGAIN;return -1;}
         for(int s=0;s<count;s++){
             long n=vnet_gso_segment(buf,len,&hd,(unsigned)s,staging,sizeof(staging));
             if(n<0)die("RX segmentation");
@@ -209,7 +212,7 @@ static ssize_t receive(const void *buf,size_t len,void *opaque){
         }
         return (ssize_t)len;
     }
-    if(!budget_take(&network_budget,len,1)){errno=EAGAIN;return -1;}
+    if(!budget_take(&rx_budget,len,1)){errno=EAGAIN;return -1;}
     if((hd.flags&VNET_F_NEEDS_CSUM)&&!(features&NET_F_GUEST_CSUM)){
         memcpy(staging,buf,len);
         if(vnet_complete_csum(staging,len,&hd))die("RX checksum offsets");
@@ -252,7 +255,7 @@ static void transmit(void){
         if((hd.flags&~VNET_F_NEEDS_CSUM)||((hd.flags&VNET_F_NEEDS_CSUM)&&!(features&NET_F_CSUM))||
            (hd.gso_type&&(hd.gso_type!=VNET_GSO_TCPV4||!(features&NET_F_HOST_TSO4))))die("TX header/offload unsupported");
         if(tx_resume&&(h!=tx_resume_head||q->pfn!=tx_resume_pfn||!hd.gso_type))tx_resume=0;
-        if(!tx_resume&&!budget_take(&network_budget,len-10,1))break;
+        if(!tx_resume&&!budget_take(&tx_budget,len-10,1))break;
         // A full socket is backpressure, not packet loss. Leave this
         // descriptor available and retry it on the next supervisor poll.
         // Direct peers take the frame whole; everything else (and anything
@@ -263,14 +266,15 @@ static void transmit(void){
         // frame cut short (tx_resume) keeps it for its remaining segments.
         if(!sent){
             if(tx_resume){tx_resume_head=h;tx_resume_pfn=q->pfn;}
-            else budget_refund(&network_budget,len-10,1);
+            else budget_refund(&tx_budget,len-10,1);
             break;
         }
         complete(q,h,0);tx++;tx_bytes+=len-10;
     }
 }
 int net_init(void *memory,size_t size,const struct hvf_options *options){
-    budget_init(&network_budget,options->network_bytes_per_second,options->network_packets_per_second,256ULL<<10,256);
+    budget_init(&rx_budget,options->network_bytes_per_second,options->network_packets_per_second,256ULL<<10,256);
+    budget_init(&tx_budget,options->network_bytes_per_second,options->network_packets_per_second,256ULL<<10,256);
     memset(cfg,0,sizeof(cfg));memset(queues,0,sizeof(queues));
     status=isr=features=selectq=rx=tx=0;quiescing=0;segment_since=segment_last=0;bar=BAR;tx_resume=0;memset(&switch_caps,0,sizeof(switch_caps));
     rx_bytes=tx_bytes=drop_packets=drop_bytes=0;

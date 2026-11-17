@@ -30,13 +30,15 @@ static net_receive_fn receive;
 static uint8_t sent[64][65536];
 static size_t sent_len[64];
 static unsigned sends,fail_at=~0u;
+static uint64_t sent_bytes;
 
 hv_return_t hv_gic_set_spi(uint32_t intid,bool asserted){(void)intid;(void)asserted;return HV_SUCCESS;}
 int net_backend_open(const struct hvf_options *options,net_receive_fn fn){(void)options;receive=fn;return 0;}
 int net_backend_send(const void *data,size_t size){
     if(sends==fail_at){fail_at=~0u;return 0;} // the broker socket is full once
-    assert(sends<64&&size<=sizeof(sent[0]));
-    memcpy(sent[sends],data,size);sent_len[sends++]=size;return 1;
+    assert(size<=sizeof(sent[0]));
+    if(sends<64){memcpy(sent[sends],data,size);sent_len[sends]=size;}
+    sends++;sent_bytes+=size;return 1;
 }
 void net_backend_poll(void){}
 void net_backend_kick(void){}
@@ -303,6 +305,33 @@ static void test_rx_segment_bound(void){
     assert(receive(packet+10,len-10,packet)==(ssize_t)(len-10)&&*used_idx(RX_RING)==121);
     net_metrics(metrics);assert(metrics[4]==drops+2);
 }
+// Rate limits apply to each direction separately: a stream of frames from
+// other guests that empties the receive allowance leaves this VM's own
+// transmissions unaffected.
+static void limited(uint64_t bytes,uint64_t packets){
+    net_close();
+    struct hvf_options options={.network_enabled=1,.network_bytes_per_second=bytes,.network_packets_per_second=packets};
+    assert(net_init(memory,SIZE,&options)==0);
+}
+static void test_rx_cannot_spend_tx_budget(void){
+    static uint8_t packet[65536];
+    limited(1<<20,0); // 256 KiB burst
+    setup(FEATURES);reset_slots();sends=0;
+    // Inbound 1500-byte frames until the receive allowance is gone.
+    uint8_t frame[1500]={0};unsigned delivered=0;
+    for(;;){
+        if(rx_slot>=64){setup(FEATURES);reset_slots();} // a fresh RX ring; the budget is the device's
+        post_rx(1,2048);
+        if(receive(frame,sizeof(frame),NULL)<0)break;
+        delivered++;
+    }
+    assert(errno==EAGAIN&&delivered>=100&&delivered<=180);
+    // A full-size frame of this VM's own still goes out at once.
+    size_t len=tso_packet(packet,1460,0);
+    tx(packet,len);
+    assert(sends==1&&*used_idx(TX_RING)==1);
+    limited(0,0);
+}
 int main(void){
     memory=calloc(1,SIZE);assert(memory);
     struct hvf_options options={.network_enabled=1};
@@ -312,6 +341,7 @@ int main(void){
     test_rx_from_peer();
     test_rx_oversized();
     test_rx_segment_bound();
+    test_rx_cannot_spend_tx_budget();
     test_switch_capabilities();
     net_close();free(memory);
     puts("net-offload: ok");
