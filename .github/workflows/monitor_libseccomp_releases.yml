@@ -11,59 +11,80 @@ permissions:
 
 jobs:
   check-release:
+    # Inherited from upstream: it tracks the Linux devctr, which this fork
+    # does not maintain.
+    if: github.repository == 'firecracker-microvm/firecracker'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-          
+        with:
+          persist-credentials: false
+
       - name: Get current libseccomp version from Dockerfile
         id: current
         run: |
           CURRENT=$(grep 'LIBSECCOMP_VER' tools/devctr/Dockerfile | grep -oP "v[0-9.]+")
-          echo "version=$CURRENT" >> $GITHUB_OUTPUT
-          
+          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+
+      # The tag name comes from another repository. It is only ever passed
+      # through the environment, never interpolated into a script, and must
+      # be a plain version tag before any later step sees it.
       - name: Check for new libseccomp release
         id: latest
         run: |
-          LATEST=$(curl -s https://api.github.com/repos/seccomp/libseccomp/releases/latest | jq -r '.tag_name')
-          echo "version=$LATEST" >> $GITHUB_OUTPUT
+          LATEST=$(curl -fsS https://api.github.com/repos/seccomp/libseccomp/releases/latest | jq -r '.tag_name')
+          if ! [[ "$LATEST" =~ ^v[0-9]{1,4}(\.[0-9]{1,4}){1,3}$ ]]; then
+            echo "::error::unexpected libseccomp tag name"
+            exit 1
+          fi
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
 
       - name: Check latest version is newer
         id: semver_check
+        env:
+          CURRENT_TAG: ${{ steps.current.outputs.version }}
+          LATEST_TAG: ${{ steps.latest.outputs.version }}
         run: |
-          CURRENT=$(echo ${{ steps.current.outputs.version }} | grep -oP "[0-9.]+")
-          LATEST=$(echo ${{ steps.latest.outputs.version }} | grep -oP "[0-9.]+") 
+          CURRENT=$(echo "$CURRENT_TAG" | grep -oP "[0-9.]+")
+          LATEST=$(echo "$LATEST_TAG" | grep -oP "[0-9.]+")
           if ! printf '%s\n%s' "$LATEST" "$CURRENT" | sort -VC && [ "$CURRENT" != "$LATEST" ]; then
-            echo "is_newer=true" >> $GITHUB_OUTPUT;
+            echo "is_newer=true" >> "$GITHUB_OUTPUT";
           else
-            echo "is_newer=false" >> $GITHUB_OUTPUT;
+            echo "is_newer=false" >> "$GITHUB_OUTPUT";
           fi
- 
+
       - name: Check if issue exists
         if: steps.semver_check.outputs.is_newer == 'true' # New release has higher semantic version
         id: issue_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          LATEST_TAG: ${{ steps.latest.outputs.version }}
         run: |
-          ISSUES=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/issues?state=open&labels=dependencies" | \
-          jq -r --arg tag "${{ steps.latest.outputs.version }}" '[.[] | select(.title | contains("chore(deps): update libseccomp to \($tag)"))] | length')
-          echo "exists=$ISSUES" >> $GITHUB_OUTPUT
+          ISSUES=$(curl -fsS -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$REPOSITORY/issues?state=open&labels=dependencies" | \
+          jq -r --arg tag "$LATEST_TAG" '[.[] | select(.title | contains("chore(deps): update libseccomp to \($tag)"))] | length')
+          echo "exists=$ISSUES" >> "$GITHUB_OUTPUT"
 
       - name: Create issue for new release
         id: create_issue
         if: steps.semver_check.outputs.is_newer == 'true' && steps.issue_check.outputs.exists == '0' # No existing issue for new version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_TAG: ${{ steps.current.outputs.version }}
+          LATEST_TAG: ${{ steps.latest.outputs.version }}
         run: |
           gh issue create \
-            --title "chore(deps): update libseccomp to ${{ steps.latest.outputs.version }}" \
+            --title "chore(deps): update libseccomp to $LATEST_TAG" \
             --body "$(cat <<EOF
-          A new version of libseccomp has been released: **${{ steps.latest.outputs.version }}**
+          A new version of libseccomp has been released: **$LATEST_TAG**
 
-          Current version in Dockerfile: **${{ steps.current.outputs.version }}**
+          Current version in Dockerfile: **$CURRENT_TAG**
 
-          Repository: https://github.com/seccomp/libseccomp/releases/tag/${{ steps.latest.outputs.version }}
+          Repository: https://github.com/seccomp/libseccomp/releases/tag/$LATEST_TAG
 
           Please review and consider updating Firecracker's dependency in \`tools/devctr/Dockerfile\`.
           EOF
           )" \
             --label "dependencies"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
