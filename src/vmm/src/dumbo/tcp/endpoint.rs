@@ -66,6 +66,10 @@ pub struct Endpoint {
     // We ignore incoming segments when this is set, and that happens when we decide to reset
     // the connection (or it decides to reset itself).
     stop_receiving: bool,
+    // Set once a request that declares a body has been answered. No further request is read:
+    // inbound payload is discarded, while ACKs still reach the connection so the pending
+    // response can be delivered. The connection is closed once that response is acknowledged.
+    closing: bool,
 }
 
 // The "contract" for the Endpoint (if it implemented a trait or something) is something along
@@ -115,6 +119,7 @@ impl Endpoint {
             last_segment_received_timestamp: timestamp_cycles(),
             eviction_threshold: eviction_threshold.get(),
             stop_receiving: false,
+            closing: false,
         })
     }
 
@@ -169,7 +174,16 @@ impl Endpoint {
 
         // Advance receive_buf_left by how many bytes were actually written.
         if let Some(len) = value {
-            self.receive_buf_left += len.get();
+            if self.closing {
+                // Nothing received after the request that started the close is kept or parsed.
+                // The bytes are dropped and the window reopened, so the other endpoint is not
+                // left waiting on a window that would never move.
+                // The unwrap is safe because len is bounded by the size of receive_buf.
+                self.connection
+                    .advance_local_rwnd_edge(u32::try_from(len.get()).unwrap());
+            } else {
+                self.receive_buf_left += len.get();
+            }
         };
 
         // The unwrap here should be safe because we assert the size whenever we append to
@@ -190,7 +204,7 @@ impl Endpoint {
             self.response_buf.clear();
         }
 
-        if self.response_buf.is_empty() {
+        if self.response_buf.is_empty() && !self.closing {
             // There's no pending response currently, so we're back to waiting for a request to be
             // available in self.receive_buf.
 
@@ -229,7 +243,9 @@ impl Endpoint {
                         // are framed by the blank line alone, so its body would otherwise
                         // be parsed as a separate request without the headers (such as
                         // X-Forwarded-For) its sender framed it with. Answer it, drop
-                        // everything after it and close the connection.
+                        // everything after it and close the connection once the response
+                        // has been delivered: closing here would place the FIN before the
+                        // response, which could then never be sent.
                         let consumed = if body { self.receive_buf_left } else { end };
                         b.copy_within(consumed.., 0);
                         self.receive_buf_left -= consumed;
@@ -238,8 +254,7 @@ impl Endpoint {
                         self.connection
                             .advance_local_rwnd_edge(u32::try_from(consumed).unwrap());
                         if body {
-                            self.stop_receiving = true;
-                            self.connection.close();
+                            self.closing = true;
                         }
                         break;
                     }
@@ -255,9 +270,9 @@ impl Endpoint {
             }
         }
 
-        // We close the connection after receiving a FIN, and making sure there are no more
-        // responses to send.
-        if self.connection.fin_received() && self.response_buf.is_empty() {
+        // We close the connection after receiving a FIN or answering a request that declared a
+        // body, and making sure there are no more responses to send.
+        if (self.connection.fin_received() || self.closing) && self.response_buf.is_empty() {
             self.connection.close();
         }
     }
@@ -453,7 +468,111 @@ mod tests {
         let response = from_utf8(&endpoint.response_buf).unwrap();
         assert_eq!(response.matches("HTTP/1.1 ").count(), 1, "{response}");
         assert_eq!(endpoint.receive_buf_left, 0);
-        assert!(endpoint.stop_receiving);
+        assert!(endpoint.closing);
+    }
+
+    // The response to a request that declares a body must reach the wire, followed by a FIN,
+    // and what the other endpoint sends meanwhile must be neither parsed nor answered.
+    #[test]
+    fn test_body_request_is_answered_then_closed() {
+        let mut buf1 = [0u8; 500];
+        let mut buf2 = [0u8; 500];
+        let mut write_buf = [0u8; RCV_BUF_MAX_SIZE as usize + 100];
+        let t = ConnectionTester::new();
+        let mut syn = t.write_syn(buf1.as_mut());
+        syn.set_flags_after_ns(TcpFlags::SYN);
+        let remote_isn = syn.sequence_number();
+        let mut endpoint = Endpoint::new_with_defaults(&syn).unwrap();
+        let endpoint_isn = endpoint
+            .write_next_segment(write_buf.as_mut(), t.mss_reserved)
+            .unwrap()
+            .inner()
+            .sequence_number();
+        {
+            let mut ctrl = t.write_ctrl(buf2.as_mut());
+            ctrl.set_flags_after_ns(TcpFlags::ACK);
+            ctrl.set_ack_number(endpoint_isn.wrapping_add(1));
+            endpoint.receive_segment(&ctrl, mock_callback);
+        }
+        assert!(endpoint.connection.is_established());
+
+        let headers = b"PUT http://169.254.169.254/latest/api/token HTTP/1.1\r\n\
+                        Content-Length: 49\r\n\r\n";
+        let mut remote_seq = remote_isn.wrapping_add(1);
+        {
+            let mut data = t.write_data(write_buf.as_mut(), headers.as_ref());
+            data.set_flags_after_ns(TcpFlags::ACK);
+            data.set_sequence_number(remote_seq);
+            data.set_ack_number(endpoint_isn.wrapping_add(1));
+            endpoint.receive_segment(&data, mock_callback);
+        }
+        remote_seq = remote_seq.wrapping_add(u32::try_from(headers.len()).unwrap());
+
+        // The body follows in a segment of its own. It is a well formed request, which must be
+        // dropped rather than parsed.
+        let body = b"GET http://169.254.169.254/latest/ HTTP/1.1\r\n\r\n";
+        {
+            let mut data = t.write_data(write_buf.as_mut(), body.as_ref());
+            data.set_flags_after_ns(TcpFlags::ACK);
+            data.set_sequence_number(remote_seq);
+            data.set_ack_number(endpoint_isn.wrapping_add(1));
+            endpoint.receive_segment(&data, |_| panic!("the body was parsed as a request"));
+        }
+        remote_seq = remote_seq.wrapping_add(u32::try_from(body.len()).unwrap());
+        assert_eq!(endpoint.receive_buf_left, 0);
+
+        // The whole response goes out, in a segment without a FIN that acknowledges the body.
+        assert_eq!(endpoint.next_segment_status(), NextSegmentStatus::Available);
+        let response_len = endpoint.response_buf.len();
+        assert!(response_len > 0);
+        let response_end = {
+            let s = endpoint
+                .write_next_segment(write_buf.as_mut(), t.mss_reserved)
+                .expect("the response must be sent");
+            assert_eq!(s.inner().flags_after_ns(), TcpFlags::ACK);
+            assert_eq!(s.inner().sequence_number(), endpoint_isn.wrapping_add(1));
+            assert_eq!(s.inner().ack_number(), remote_seq);
+            assert_eq!(usize::from(s.inner().payload_len()), response_len);
+            let response = from_utf8(s.inner().payload()).unwrap();
+            assert_eq!(response.matches("HTTP/1.1 ").count(), 1, "{response}");
+            s.inner()
+                .sequence_number()
+                .wrapping_add(u32::from(s.inner().payload_len()))
+        };
+
+        // The other endpoint acknowledges the response in a segment that carries more data.
+        // The acknowledgement counts, the data is dropped, and the FIN follows the response.
+        {
+            let mut data = t.write_data(write_buf.as_mut(), body.as_ref());
+            data.set_flags_after_ns(TcpFlags::ACK);
+            data.set_sequence_number(remote_seq);
+            data.set_ack_number(response_end);
+            endpoint.receive_segment(&data, |_| panic!("data after the body was parsed"));
+        }
+        remote_seq = remote_seq.wrapping_add(u32::try_from(body.len()).unwrap());
+        assert_eq!(endpoint.receive_buf_left, 0);
+        assert!(endpoint.response_buf.is_empty());
+        assert_eq!(endpoint.next_segment_status(), NextSegmentStatus::Available);
+        {
+            let s = endpoint
+                .write_next_segment(write_buf.as_mut(), t.mss_reserved)
+                .expect("the FIN must be sent");
+            assert_eq!(s.inner().flags_after_ns(), TcpFlags::ACK | TcpFlags::FIN);
+            assert_eq!(s.inner().sequence_number(), response_end);
+            assert_eq!(s.inner().ack_number(), remote_seq);
+            assert_eq!(s.inner().payload_len(), 0);
+        }
+        assert!(!endpoint.is_done());
+
+        // The other endpoint closes its half too, and the connection is finished.
+        {
+            let mut ctrl = t.write_ctrl(buf2.as_mut());
+            ctrl.set_flags_after_ns(TcpFlags::ACK | TcpFlags::FIN);
+            ctrl.set_sequence_number(remote_seq);
+            ctrl.set_ack_number(response_end.wrapping_add(1));
+            endpoint.receive_segment(&ctrl, |_| panic!("no request is pending"));
+        }
+        assert!(endpoint.is_done());
     }
 
     #[test]
