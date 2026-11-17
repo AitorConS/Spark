@@ -72,6 +72,22 @@ The client never creates, deletes, or replaces the server socket.
   it never implicitly reuses the authority saved in the snapshot.
   Slirp also reinitializes networking on restore.
 
+### Switch capabilities
+
+A switch that takes whole TSO frames for its gateway announces it in-band,
+with an Ethernet frame of EtherType `0x88B5` (`"JRBC"`, version 1, flags,
+MTU) addressed to the VM's MAC. Its only protection is where it may appear:
+
+- It counts only as the **first frame of a link**. The VMM drops any later
+  frame of that EtherType before it is acted on, and a new connection (or a
+  link handed from the broker to the VMM) starts over.
+- The VMM never sends a guest's frame of that EtherType to the switch; it
+  sends only its own answer.
+- **The switch must never forward a frame of EtherType `0x88B5` received on
+  one VM's link to another link**, and must send its announcement only as
+  the first frame of each link. A switch that forwards it lets one VM set
+  another VM's gateway, MTU and TSO mode at the start of a link.
+
 `GET /capabilities` advertises both backends, framing, maximum size, reconnection
 interval, snapshot restore contract, and
 `network_policy: external-switch-unix-capability` when applicable. The

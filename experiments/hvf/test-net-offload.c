@@ -243,6 +243,12 @@ static void test_switch_capabilities(void){
         const uint8_t *p=rx_packet(i);size_t n=*used_len(RX_RING,i)-10;
         assert(n==ETH+40+(i<3?8960:30000-3*8960)&&tcp_valid(p+10,n));
     }
+    // A guest's frame of the capability EtherType never reaches the switch,
+    // where it could pass for the switch's announcement on another VM's link.
+    sends=0;uint8_t forged[70]={0};memcpy(forged+10,"\x02\0\0\0\0\x03\x02\0\0\0\0\x01\x88\xb5JRBC\x01\x01\x02\x40",22);
+    uint16_t completed=*used_idx(TX_RING);
+    tx(forged,sizeof(forged));
+    assert(sends==0&&*used_idx(TX_RING)==completed+1);
     // An oversized frame that is not whole TCPv4 is dropped, never fatal.
     setup(FEATURES);reset_slots();post_rx(1,65536);
     net_metrics(metrics);uint64_t drops=metrics[4];

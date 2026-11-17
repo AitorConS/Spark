@@ -120,6 +120,11 @@ static void deliver(const uint8_t header[10],const uint8_t *frame,size_t len){
 // whole TSO frames for its gateway says so, with the gateway's MAC and MTU,
 // in the first frame of each link; the VMM answers that it takes them too.
 // Without that frame (older jerboad) every TSO frame is segmented as before.
+// The frame is in-band, so its provenance rests on three things: the stream
+// layer drops one that is not the first frame of its link
+// (net_backend_stream.h), the VMM never forwards a guest's frame of this
+// EtherType (to_switch), and the switch never forwards one from a VM's link
+// (UNIX_STREAM.md).
 #define SWITCH_CAPS_TYPE 0x88b5
 #define SWITCH_CAPS_SIZE 60
 #define SWITCH_CAPS_LARGE 1u
@@ -237,6 +242,9 @@ static int to_switch(uint8_t *frame,size_t len,const struct vnet_hdr *hd){
         }
         tx_resume=0;return 1;
     }
+    // Only the VMM speaks the capability protocol: a guest frame that would
+    // look like the switch's announcement on another VM's link goes nowhere.
+    if((frame[12]<<8|frame[13])==SWITCH_CAPS_TYPE)return 1;
     if((hd->flags&VNET_F_NEEDS_CSUM)&&vnet_complete_csum(frame,len,hd))die("TX checksum offsets");
     return net_backend_send(frame,len);
 }

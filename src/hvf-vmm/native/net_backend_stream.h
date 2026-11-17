@@ -27,14 +27,24 @@ static struct {
     // rx_start/rx_used delimit buffered bytes; later frames remain in place.
     size_t used, need, rx_start, rx_used, sent, queued, tx_head;
     uint64_t retry, progress, tx_progress, drops, drop_bytes;
+    // Frames delivered on the current link. Switch capabilities (EtherType
+    // 0x88B5, see net.c) are valid only as the first frame of a link, and
+    // only this layer knows where a link starts.
+    uint64_t frames_in;
 } stream = {.fd=-1};
+#define STREAM_CAPABILITIES 0x88b5
+// A capability frame after the first frame of its link is not the switch's
+// announcement: it is dropped before anything acts on it.
+static int stream_misplaced(const uint8_t *frame,size_t size) {
+    return stream.frames_in && size>=14 && (frame[12]<<8|frame[13])==STREAM_CAPABILITIES;
+}
 static uint64_t stream_ms(void) {
     struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);
     return (uint64_t)t.tv_sec*1000+t.tv_nsec/1000000;
 }
 static void stream_disconnect(void) {
     if(stream.fd>=0)close(stream.fd);
-    stream.fd=-1;stream.connecting=0;stream.used=0;stream.need=4;stream.rx_start=stream.rx_used=0;
+    stream.fd=-1;stream.connecting=0;stream.used=0;stream.need=4;stream.rx_start=stream.rx_used=0;stream.frames_in=0;
     for(size_t offset=stream.tx_head;offset<stream.queued;){
         uint32_t size=0;
         for(unsigned i=0;i<4;i++)size=(size<<8)|stream.tx[offset+i];
@@ -132,6 +142,7 @@ static int stream_offer(const void *data,size_t size) {
 static void stream_retry_held(void) {
     if(stream.fd<0 || stream.need<=4 || stream.used!=stream.need)return;
     if(stream.receive(stream.rx+stream.rx_start+4,stream.need-4,NULL)<0)return;
+    stream.frames_in++;
     stream.rx_start+=stream.need;stream.rx_used-=stream.need;
     if(!stream.rx_used)stream.rx_start=0;
     stream.need=4;stream.used=0;
@@ -161,10 +172,14 @@ static void stream_poll(void) {
             // Keep used==need if the callback applies backpressure: the broker
             // uses that condition to stop polling the stream socket for RX.
             // Temporary backpressure retries later; other failures reconnect.
-            if(stream.receive(stream.rx+stream.rx_start+4,stream.need-4,NULL)<0){
-                if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=ENOBUFS&&errno!=EINTR)
-                    stream_disconnect();
-                return;
+            const uint8_t *frame=stream.rx+stream.rx_start+4;
+            if(!stream_misplaced(frame,stream.need-4)){
+                if(stream.receive(frame,stream.need-4,NULL)<0){
+                    if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=ENOBUFS&&errno!=EINTR)
+                        stream_disconnect();
+                    return;
+                }
+                stream.frames_in++;
             }
             stream.rx_start+=stream.need;
             stream.rx_used-=stream.need;

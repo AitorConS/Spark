@@ -275,7 +275,7 @@ static void link_service(void){
         if(fcntl(descriptor,F_SETFD,FD_CLOEXEC)){close(descriptor);continue;}
         if(stream.fd>=0)close(stream.fd);
         int paused=stream.paused;
-        stream.fd=descriptor;stream.connecting=0;stream.used=0;stream.need=4;stream.rx_start=stream.rx_used=0;
+        stream.fd=descriptor;stream.connecting=0;stream.used=0;stream.need=4;stream.rx_start=stream.rx_used=0;stream.frames_in=0;
         stream.queued=stream.sent=stream.tx_head=0;stream.progress=stream.tx_progress=stream_ms();stream.paused=paused;
         if(!link_generation)fprintf(stderr,"network: direct link to the switch\n");
         link_generation=generation;link_lost=0;link_partial_polls=0;
