@@ -372,7 +372,11 @@ The directory contains versioned manifest, full RAM, per-CPU state
 devices, firmware, kernel/initrd and copies of all disks, including RO.
 It contains no host pointers or descriptors. It is written to a private temporary,
 files and directory are synced and published via atomic rename.
-A failure preserves the previous snapshot. The per-file size quota also
+A failure preserves the previous snapshot. The parent of `snapshot_path`
+must be owned by the user (or root) and not writable by others unless it is
+sticky, like `/private/tmp`; an existing destination is replaced only if it is
+still the snapshot directory checked when the request was accepted, and
+nothing that appears there during the copy is replaced. The per-file size quota also
 limits captured RAM and disks; configure sufficient space before booting.
 
 Restore first validates schema, names, limits and compatibility;
