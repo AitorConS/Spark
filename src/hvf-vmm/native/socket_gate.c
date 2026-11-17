@@ -145,7 +145,7 @@ static void udp_poll(struct udp *slot,int outgoing,int incoming,unsigned *remain
     }
 }
 static void authority(int fd,pid_t parent){
-    signal(SIGTERM,SIG_DFL);signal(SIGINT,SIG_DFL);
+    signal(SIGTERM,SIG_DFL);signal(SIGINT,SIG_DFL);signal(SIGPIPE,SIG_IGN); // EPIPE, never a signal
     const char *lease_env=getenv("HVF_LEASE_FD");int lease=lease_env?atoi(lease_env):-1;
     long maximum=sysconf(_SC_OPEN_MAX);if(maximum<0||maximum>1048576)maximum=1048576;
     for(int candidate=0;candidate<maximum;candidate++)if(candidate!=fd&&candidate!=2&&candidate!=lease)close(candidate);

@@ -104,6 +104,10 @@ static void broker_main(const struct hvf_options *options){
     if(net_forget_guest_memory())_exit(2);
     if(options->cpu_seconds){struct rlimit limit={options->cpu_seconds,options->cpu_seconds};if(setrlimit(RLIMIT_CPU,&limit))_exit(2); }
     signal(SIGTERM,SIG_DFL);signal(SIGINT,SIG_DFL);
+    // A write to a peer-closed socket (slirp's host TCP sockets) must fail with
+    // EPIPE, not end the broker: set it here rather than rely on what the Rust
+    // runtime of the forked VMM happened to leave.
+    signal(SIGPIPE,SIG_IGN);
     // Retain only IPC, stderr, and the inherited workspace lease. No disk FDs.
     const char *lease_env=getenv("HVF_LEASE_FD");
     int lease=lease_env?atoi(lease_env):-1;

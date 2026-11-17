@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 static Slirp *slirp;
 static net_receive_fn receive_packet;
 // Jerboa guests resolve through 10.53.0.53, the address every Jerboa network
@@ -69,7 +70,9 @@ static ssize_t deliver(const void *data,size_t size,void *opaque){
     }
     return receive_packet(data,size,opaque);
 }
-static void die(const char *why){fprintf(stderr,"slirp backend error: %s\n",why);exit(2);}
+// Runs in the forked broker: _exit, never exit, so the VMM's atexit handlers
+// (the Rust private-directory cleanup) do not run in this process.
+static void die(const char *why){fprintf(stderr,"slirp backend error: %s\n",why);_exit(2);}
 static int64_t paused_at, clock_offset;
 static int64_t host_now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (int64_t)t.tv_sec*1000000000+t.tv_nsec;}
 static int64_t now(void *opaque){(void)opaque;return (paused_at?paused_at:host_now())-clock_offset;}
