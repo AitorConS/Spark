@@ -118,6 +118,8 @@ static int cpu_snapshot(struct cpu *c,int restore){
     uint32_t index=c->index;SNAP(&s,index);if(index!=c->index)s.error=1;
     SNAP(&s,c->started);SNAP(&s,c->entry);SNAP(&s,c->context);SNAP(&s,c->os_lock);SNAP(&s,c->os_double_lock);
     if(c->started!=0 && c->started!=1)s.error=1;
+    // The live trap path keeps only bit 0 of each lock: so must a restore.
+    if(c->os_lock>1 || c->os_double_lock>1)s.error=1;
     for(unsigned i=HV_REG_X0;i<=HV_REG_CPSR;i++){
         uint64_t value=0;if(!restore && hv_vcpu_get_reg(c->id,(hv_reg_t)i,&value))s.error=1;
         SNAP(&s,value);
