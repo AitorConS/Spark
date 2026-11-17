@@ -304,7 +304,8 @@ static void test_relay(void){
 }
 // A peer that frees one datagram slot at a time must not re-arm the stall
 // bound with each send that fits: the time net_peer_send keeps the TX head
-// (returns 0) is bounded overall, not per refusal episode.
+// (returns 0) is bounded overall, by the frames the peer takes, not per
+// refusal episode.
 static uint64_t test_ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000+(uint64_t)t.tv_nsec/1000000;}
 static void test_trickle_stall(void){
     int channel[2],link[2];
@@ -332,12 +333,55 @@ static void test_trickle_stall(void){
     // Before the bound was cumulative the head stayed retained for the whole 800 ms.
     if(retained>=300){fprintf(stderr,"trickling peer retained the TX head for %llu ms\n",(unsigned long long)retained);abort();}
     uint64_t metrics[7];net_peer_metrics(metrics);assert(metrics[5]>0);
-    // A link that has drained and taken frames for a whole window applies backpressure again.
+    // A link that drains and takes frames again earns its backpressure back:
+    // by the time it is full, the refused frame is held, not dropped.
     while(recv(link[1],got,sizeof(got),MSG_DONTWAIT)>0){}
-    usleep(150000);
+    uint64_t dropped=metrics[5];int result;
     assert(net_peer_send(f,size)==1);
-    while(net_peer_send(f,size)==1){}
+    while((result=net_peer_send(f,size))==1){net_peer_metrics(metrics);assert(metrics[5]==dropped);}
+    assert(result==0);
     while(recv(link[1],got,sizeof(got),MSG_DONTWAIT)>0){}
+    net_peer_close();close(channel[1]);close(link[1]);
+}
+// A saturated but healthy peer keeps refusing frames, because the sender is
+// faster than it, yet takes many between refusals. It must see backpressure
+// for as long as that lasts, never drops: the stall bound is for a peer that
+// holds the TX head without taking frames.
+static void test_saturated_link(void){
+    int channel[2],link[2];
+    assert(!socketpair(AF_UNIX,SOCK_DGRAM,0,channel)&&!socketpair(AF_UNIX,SOCK_DGRAM,0,link));
+    set_timeout(channel[1]);size_link(link[1]);
+    net_peer_open(channel[0],self_mac,deliver);
+    struct peer_message welcome={.type=PEER_WELCOME,.epoch=17};memcpy(welcome.mac,self_mac,6);memcpy(welcome.ip,self_ip,4);
+    struct peer_message add={.type=PEER_ADD,.epoch=17,.value=5};memcpy(add.mac,peer_mac,6);memcpy(add.ip,peer_ip,4);
+    send_message(channel[1],&welcome,-1);send_message(channel[1],&add,link[0]);close(link[0]);
+    net_peer_poll();
+    struct peer_message m;assert(read_message(channel[1],&m)<0&&m.type==PEER_ACK&&m.flags==1);
+    static uint8_t f[9010],got[65536];size_t size=vipv4(f,peer_mac,self_mac,self_ip,9000);
+    // Every 2 ms the peer reads eight frames and the sender refills the link
+    // until it is refused: a refusal each cycle, for five stall windows.
+    uint64_t start=test_ms(),accepted=0,refusals=0,received=0,metrics[7]={0};
+    while(test_ms()-start<500&&!metrics[5]){
+        int result;
+        // A dropped frame also returns 1: the drop counter tells them apart.
+        while((result=net_peer_send(f,size))==1){
+            net_peer_metrics(metrics);
+            if(metrics[5])break;
+            accepted++;
+        }
+        if(metrics[5])break;
+        assert(result==0);refusals++;
+        usleep(2000);
+        for(int i=0;i<8;i++)if(recv(link[1],got,sizeof(got),MSG_DONTWAIT)>0)received++;
+    }
+    while(recv(link[1],got,sizeof(got),MSG_DONTWAIT)>0)received++;
+    net_peer_metrics(metrics);
+    if(metrics[5]||received!=accepted){
+        fprintf(stderr,"saturated link: %llu frames dropped as stalled, %llu accepted, %llu received, %llu refusals\n",
+            (unsigned long long)metrics[5],(unsigned long long)accepted,(unsigned long long)received,(unsigned long long)refusals);
+        abort();
+    }
+    assert(refusals>20&&metrics[0]==accepted);
     net_peer_close();close(channel[1]);close(link[1]);
 }
 // Built with PEER_IDLE_MS=400: a quiet link is reported idle exactly once,
@@ -407,6 +451,7 @@ int main(void){
     test_relay();
     test_idle();
     test_trickle_stall();
+    test_saturated_link();
     test_sandboxed_vmm();
     puts("net-peer: ok");
     return 0;
