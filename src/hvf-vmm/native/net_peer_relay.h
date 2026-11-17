@@ -89,7 +89,8 @@ static void relay_release(uint64_t id){
     }
 }
 static void relay_from_switch(void){
-    for(;;){
+    // Bounded per call like the other loops; the rest waits for the next pass.
+    for(unsigned budget=0;budget<4*64;budget++){
         char space[CMSG_SPACE(4*sizeof(int))];
         struct iovec io={relay.in+relay.used,PEER_MESSAGE-relay.used};
         struct msghdr h={.msg_iov=&io,.msg_iovlen=1,.msg_control=space,.msg_controllen=sizeof(space)};

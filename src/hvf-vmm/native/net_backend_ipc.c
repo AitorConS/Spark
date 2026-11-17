@@ -63,7 +63,8 @@ static int link_message(int fd,uint8_t kind,uint64_t generation,int descriptor){
 }
 // Returns 1 with a message (and *descriptor, or -1), 0 when none is queued.
 static int link_receive(int fd,uint8_t *kind,uint64_t *generation,int *descriptor){
-    for(;;){
+    // Bounded: a flood of invalid datagrams must not keep the device loop here.
+    for(unsigned budget=0;budget<64;budget++){
         uint8_t wire[LINK_MESSAGE+1];char space[CMSG_SPACE(sizeof(int))];
         struct iovec io={wire,sizeof(wire)};
         struct msghdr h={.msg_iov=&io,.msg_iovlen=1,.msg_control=space,.msg_controllen=sizeof(space)};
@@ -83,6 +84,7 @@ static int link_receive(int fd,uint8_t *kind,uint64_t *generation,int *descripto
         for(unsigned i=0;i<8;i++)*generation|=(uint64_t)wire[8+i]<<(8*i);
         return 1;
     }
+    return 0;
 }
 static void fail(const char *message){fprintf(stderr,"network IPC: %s\n",message);exit(2);}
 static ssize_t broker_deliver(const void *data,size_t size,void *opaque){
@@ -274,7 +276,7 @@ int net_backend_send(const void *data,size_t size){
 static void link_service(void){
     if(link_channel<0)return;
     uint8_t kind;uint64_t generation;int descriptor;
-    while(link_receive(link_channel,&kind,&generation,&descriptor)){
+    for(unsigned budget=0;budget<16&&link_receive(link_channel,&kind,&generation,&descriptor);budget++){
         if(kind!=LINK_OFFER||descriptor<0||generation<=link_generation){if(descriptor>=0)close(descriptor);continue;}
         if(fcntl(descriptor,F_SETFD,FD_CLOEXEC)){close(descriptor);continue;}
         if(stream.fd>=0)close(stream.fd);
