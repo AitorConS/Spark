@@ -514,8 +514,14 @@ mod tests {
         // and its PID now belongs to another process.
         let table = Table([(10, (1, 10, 1)), (11, (1, 11, 2)), (12, (1, 12, 9))].into());
         let known = [
-            Member { pid: 11, start: (2, 0) },
-            Member { pid: 12, start: (3, 0) },
+            Member {
+                pid: 11,
+                start: (2, 0),
+            },
+            Member {
+                pid: 12,
+                start: (3, 0),
+            },
         ]
         .into();
         let mut signalled = Vec::new();
