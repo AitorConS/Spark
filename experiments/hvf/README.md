@@ -321,7 +321,7 @@ unlimited; set either `network_bytes_per_second` (1 MiB/s..1 TiB/s) or
 independently. Each network cap applies separately to each direction, as
 upstream Firecracker's RX and TX rate limiters do: traffic other guests send
 to a VM spends only its receive allowance, never what its own transmissions
-need.
+need. A TSO frame costs the packets and bytes of the segments it stands for.
 Explicit caps still use the same bounded bursts and are not
 equivalent to cgroups or kernel network quotas. `--no-api` also keeps a private
 supervisor.

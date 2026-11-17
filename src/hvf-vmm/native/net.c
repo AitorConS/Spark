@@ -240,6 +240,18 @@ static int to_switch(uint8_t *frame,size_t len,const struct vnet_hdr *hd){
     if((hd->flags&VNET_F_NEEDS_CSUM)&&vnet_complete_csum(frame,len,hd))die("TX checksum offsets");
     return net_backend_send(frame,len);
 }
+// What a TX frame costs against the rate limits: the frames and bytes it
+// stands for on a wire. A TSO frame is charged one packet and one copy of its
+// headers per segment, however it then leaves (segmented for the switch, or
+// whole to a gateway or peer), so gso_size cannot multiply the cap.
+static void tx_cost(const uint8_t *frame,size_t len,const struct vnet_hdr *hd,uint64_t *bytes,uint64_t *packets){
+    *bytes=len;*packets=1;
+    int count=hd->gso_type?vnet_gso_count(frame,len,hd):1;
+    if(count>1){
+        size_t headers=14+(size_t)(frame[14]&15)*4;headers+=(size_t)(frame[headers+12]>>4)*4;
+        *bytes=len+(uint64_t)(count-1)*headers;*packets=(uint64_t)count;
+    }
+}
 static void transmit(void){
     struct queue *q=&queues[1];
     for(unsigned budget=0;budget<256 && pending(q);budget++){
@@ -255,7 +267,8 @@ static void transmit(void){
         if((hd.flags&~VNET_F_NEEDS_CSUM)||((hd.flags&VNET_F_NEEDS_CSUM)&&!(features&NET_F_CSUM))||
            (hd.gso_type&&(hd.gso_type!=VNET_GSO_TCPV4||!(features&NET_F_HOST_TSO4))))die("TX header/offload unsupported");
         if(tx_resume&&(h!=tx_resume_head||q->pfn!=tx_resume_pfn||!hd.gso_type))tx_resume=0;
-        if(!tx_resume&&!budget_take(&tx_budget,len-10,1))break;
+        uint64_t cost_bytes,cost_packets;tx_cost(frame+10,len-10,&hd,&cost_bytes,&cost_packets);
+        if(!tx_resume&&!budget_take(&tx_budget,cost_bytes,cost_packets))break;
         // A full socket is backpressure, not packet loss. Leave this
         // descriptor available and retry it on the next supervisor poll.
         // Direct peers take the frame whole; everything else (and anything
@@ -266,7 +279,7 @@ static void transmit(void){
         // frame cut short (tx_resume) keeps it for its remaining segments.
         if(!sent){
             if(tx_resume){tx_resume_head=h;tx_resume_pfn=q->pfn;}
-            else budget_refund(&tx_budget,len-10,1);
+            else budget_refund(&tx_budget,cost_bytes,cost_packets);
             break;
         }
         complete(q,h,0);tx++;tx_bytes+=len-10;

@@ -332,6 +332,19 @@ static void test_rx_cannot_spend_tx_budget(void){
     assert(sends==1&&*used_idx(TX_RING)==1);
     limited(0,0);
 }
+// A TSO frame costs one packet per segment it becomes: under a packet cap,
+// a tiny gso_size cannot turn one token into hundreds of wire frames.
+static void test_tx_tso_charged_per_segment(void){
+    static uint8_t packet[65536];
+    limited(0,1); // 256-packet burst
+    setup(FEATURES);reset_slots();sends=0;sent_bytes=0;
+    size_t len=tso_packet(packet,200,1);
+    tx(packet,len);
+    assert(sends==200&&*used_idx(TX_RING)==1);
+    tx(packet,len); // 56 tokens left: retained, not sent
+    assert(sends==200&&*used_idx(TX_RING)==1);
+    limited(0,0);
+}
 int main(void){
     memory=calloc(1,SIZE);assert(memory);
     struct hvf_options options={.network_enabled=1};
@@ -342,6 +355,7 @@ int main(void){
     test_rx_oversized();
     test_rx_segment_bound();
     test_rx_cannot_spend_tx_budget();
+    test_tx_tso_charged_per_segment();
     test_switch_capabilities();
     net_close();free(memory);
     puts("net-offload: ok");
