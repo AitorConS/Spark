@@ -85,6 +85,9 @@ static void test_source_contract(void){
     assert(!net_frame_source_valid(f,arp(f,peer_mac,self_mac,peer_ip),self_mac,self_ip));
     ipv4(f,peer_mac,self_mac,self_ip,60);f[12]=0x86;f[13]=0xdd;
     assert(!net_frame_source_valid(f,60,self_mac,self_ip));                                     // IPv6
+    // An IPv4 frame that ends with its Ethernet header is read no further (ASan checks).
+    uint8_t *exact=malloc(14);assert(exact);memcpy(exact,f,12);exact[12]=8;exact[13]=0;
+    assert(!net_frame_source_valid(exact,14,self_mac,self_ip));free(exact);
 }
 static void test_protocol(void){
     uint8_t wire[PEER_MESSAGE];struct peer_message in={.type=PEER_ADD,.flags=1,.epoch=0x1122334455667788ULL,.value=0xa0b0c0d0},out;
@@ -117,6 +120,16 @@ static void test_data_plane(void){
     send_message(channel[1],&stale,link[0]);close(link[0]);close(link[1]);
     net_peer_poll();
     assert(read_message(channel[1],&m)<0&&m.type==PEER_ACK&&m.flags==0&&m.value==42);
+
+    // A peer may not claim this VM's own address, nor the broadcast address.
+    static const uint8_t broadcast_ip[4]={255,255,255,255};
+    for(int i=0;i<2;i++){
+        struct peer_message claim=add;memcpy(claim.ip,i?broadcast_ip:self_ip,4);
+        assert(!socketpair(AF_UNIX,SOCK_DGRAM,0,link));
+        send_message(channel[1],&claim,link[0]);close(link[0]);close(link[1]);
+        net_peer_poll();
+        assert(read_message(channel[1],&m)<0&&m.type==PEER_ACK&&m.flags==0);
+    }
 
     // A stream socket is not an Ethernet link.
     assert(!socketpair(AF_UNIX,SOCK_STREAM,0,link));

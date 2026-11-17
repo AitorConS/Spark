@@ -44,8 +44,9 @@ int net_frame_source_valid(const uint8_t *f,size_t len,const uint8_t mac[6],cons
     if(len<14||memcmp(f+6,mac,6))return 0;
     switch(be16(f+12)){
     case 0x0800:{
+        if(len<34)return 0; // before f[14]: the frame may end right after its Ethernet header
         size_t header=(size_t)(f[14]&15)*4;
-        return len>=34&&f[14]>>4==4&&header>=20&&len>=14+header&&!memcmp(f+26,ip,4);
+        return f[14]>>4==4&&header>=20&&len>=14+header&&!memcmp(f+26,ip,4);
     }
     case 0x0806:
         return len>=42&&be16(f+14)==1&&be16(f+16)==0x0800&&f[18]==6&&f[19]==4&&
@@ -79,8 +80,11 @@ static int configure(int fd){
         setsockopt(fd,SOL_SOCKET,SO_RCVBUF,&size,sizeof(size))?-1:0;
 }
 static int peer_add(const struct peer_message *m,int fd){
-    static const uint8_t zero[4];
-    if(!epoch||m->epoch!=epoch||(m->mac[0]&1)||!memcmp(m->mac,self_mac,6)||!memcmp(m->ip,zero,4)||configure(fd))return 0;
+    static const uint8_t zero[4],broadcast[4]={255,255,255,255};
+    // The switch assigns addresses; a peer claiming this VM's own or the
+    // broadcast address is refused all the same.
+    if(!epoch||m->epoch!=epoch||(m->mac[0]&1)||!memcmp(m->mac,self_mac,6)||!memcmp(m->ip,zero,4)||
+       !memcmp(m->ip,self_ip,4)||!memcmp(m->ip,broadcast,4)||configure(fd))return 0;
     for(unsigned i=0;i<npeers;i++)if(peers[i].id==m->value||!memcmp(peers[i].mac,m->mac,6))peers[i].dead=1;
     compact();
     uint8_t *buf=npeers<PEER_MAX?malloc(PEER_FRAME):NULL;
