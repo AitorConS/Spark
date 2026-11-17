@@ -373,10 +373,14 @@ devices, firmware, kernel/initrd and copies of all disks, including RO.
 It contains no host pointers or descriptors. It is written to a private temporary,
 files and directory are synced and published via atomic rename.
 A failure preserves the previous snapshot. The parent of `snapshot_path`
-must be owned by the user (or root) and not writable by others unless it is
-sticky, like `/private/tmp`; an existing destination is replaced only if it is
-still the snapshot directory checked when the request was accepted, and
-nothing that appears there during the copy is replaced. The per-file size quota also
+must be owned by the user (or root) and writable by neither group nor others
+unless it is sticky, like `/private/tmp`. A group-writable directory without
+the sticky bit (mode `0775` or `0770`, as shared project directories often
+are) is refused with `snapshot parent directory must be private or sticky`:
+use `chmod g-w` or `chmod +t` on it, or capture into a directory of your own.
+Earlier builds accepted such a parent. An existing destination is replaced
+only if it is still the snapshot directory checked when the request was
+accepted, and nothing that appears there during the copy is replaced. The per-file size quota also
 limits captured RAM and disks; configure sufficient space before booting.
 
 Restore first validates schema, names, limits and compatibility;

@@ -98,6 +98,13 @@ interface and an explicitly authorized current switch socket; external switch
 state and live connections are not restored. Forced termination is not a clean
 guest shutdown.
 
+A snapshot is written only into a directory that no other user can rename
+entries in: the parent of `snapshot_path` must be owned by you or root, and
+writable by neither group nor others unless it has the sticky bit. A
+group-writable parent without it, which earlier builds accepted, now fails
+with `snapshot parent directory must be private or sticky`; see
+[`experiments/hvf/README.md`](experiments/hvf/README.md).
+
 This fork is intended for local development and experimentation. Public signed
 distribution, broader hardware qualification, a full 24-hour stability campaign,
 and physical power-loss certification remain outside the current validation.
