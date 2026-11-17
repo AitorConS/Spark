@@ -3,7 +3,8 @@
 use crate::Result;
 
 pub(crate) fn restrict_child() -> Result<()> {
-    let mut keep = vec![0, 1, 2]; // Explicit inherited console, not ambient files.
+    // stdin is /dev/null, stdout the console, stderr startup.log: explicit, not ambient.
+    let mut keep = vec![0, 1, 2];
     for name in ["HVF_READY_FD", "HVF_METRICS_FD", "HVF_LEASE_FD"] {
         retain(&mut keep, &std::env::var(name)?)?;
     }

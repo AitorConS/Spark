@@ -329,6 +329,9 @@ fn launch(
                 .collect::<Vec<_>>()
                 .join(","),
         )
+        // The VMM never reads stdin (the console is output-only), and must not
+        // hold the operator's terminal open for reading.
+        .stdin(std::process::Stdio::null())
         // Append-only, so cap_log can shorten it while the VMM keeps writing.
         .stderr(
             fs::OpenOptions::new()
@@ -336,7 +339,7 @@ fn launch(
                 .append(true)
                 .open(&log_path)?,
         );
-    // SAFETY: only async-signal-safe fcntl executes between fork and exec. The
+    // SAFETY: only async-signal-safe setsid and fcntl execute between fork and exec. The
     // private socket descriptor remains alive until spawn completes.
     unsafe {
         command.pre_exec(move || {
@@ -345,7 +348,11 @@ fn launch(
                     return Err(std::io::Error::last_os_error());
                 }
             }
-            if libc::setpgid(0, 0) < 0
+            // A session of its own (and so a process group whose ID is its
+            // PID, which kill_group signals): no controlling terminal, so the
+            // stdout it keeps for the console grants no terminal control
+            // (TIOCSTI, foreground group) over the operator's shell.
+            if libc::setsid() < 0
                 || libc::fcntl(fd, libc::F_SETFD, 0) < 0
                 || libc::fcntl(metrics_fd, libc::F_SETFD, 0) < 0
                 || libc::fcntl(lease_fd, libc::F_SETFD, 0) < 0
