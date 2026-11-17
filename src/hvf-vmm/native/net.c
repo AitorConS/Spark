@@ -210,9 +210,12 @@ static ssize_t receive(const void *buf,size_t len,void *opaque){
         }
         segment_since=0;
         if(!budget_take(&rx_budget,len,(unsigned)count)){errno=EAGAIN;return -1;}
+        // The checks above make these cannot-fail paths; if they ever disagree
+        // with the segmenter, the frame (from another guest) is dropped: it
+        // must never end this VM.
         for(int s=0;s<count;s++){
             long n=vnet_gso_segment(buf,len,&hd,(unsigned)s,staging,sizeof(staging));
-            if(n<0)die("RX segmentation");
+            if(n<0){drop_packets++;drop_bytes+=len;return (ssize_t)len;}
             deliver(plain,staging,(size_t)n);
         }
         return (ssize_t)len;
@@ -220,7 +223,7 @@ static ssize_t receive(const void *buf,size_t len,void *opaque){
     if(!budget_take(&rx_budget,len,1)){errno=EAGAIN;return -1;}
     if((hd.flags&VNET_F_NEEDS_CSUM)&&!(features&NET_F_GUEST_CSUM)){
         memcpy(staging,buf,len);
-        if(vnet_complete_csum(staging,len,&hd))die("RX checksum offsets");
+        if(vnet_complete_csum(staging,len,&hd)){drop_packets++;drop_bytes+=len;return (ssize_t)len;}
         deliver(plain,staging,len);return (ssize_t)len;
     }
     deliver(opaque?opaque:plain,buf,len);return (ssize_t)len;
