@@ -80,7 +80,9 @@ fn open_log(path: &Path, write: bool) -> std::io::Result<fs::File> {
     let file = fs::OpenOptions::new()
         .read(true)
         .append(write)
-        .custom_flags(libc::O_NOFOLLOW)
+        // O_NONBLOCK: a FIFO put in its place must not block the open; it is
+        // then refused as not a regular file. No effect on a regular file.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() || meta.nlink() != 1 {
@@ -420,13 +422,15 @@ fn launch(
             return Err(error.into());
         }
         let status = guest.try_reap()?;
-        let mut detail = String::new();
-        fs::File::open(log_path)?
+        // The VMM can write its work directory: read the log as every other
+        // reader does (no link, regular, one name), and as bytes.
+        let mut detail = Vec::new();
+        open_log(&log_path, false)?
             .take(65536)
-            .read_to_string(&mut detail)?;
+            .read_to_end(&mut detail)?;
         return Err(format!(
             "BOOT_FAILED: {reason} (status {status:?}): {}",
-            detail.trim()
+            String::from_utf8_lossy(&detail).trim()
         )
         .into());
     }
@@ -515,6 +519,16 @@ mod tests {
         // Under the cap nothing changes.
         cap_log(&path).unwrap();
         assert_eq!(fs::read(&path).unwrap(), trimmed);
+    }
+
+    #[test]
+    fn open_log_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("startup.log");
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(open_log(&path, false).is_err());
     }
 
     #[test]
