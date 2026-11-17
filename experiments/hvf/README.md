@@ -387,6 +387,16 @@ identifier and device model. The identifier derives from sources and toolchain;
 relocating or re-signing the same build does not change it. Hashes check
 integrity, they do not authenticate the creator: keep snapshots private.
 
+A snapshot resumes the guest exactly as captured, including its kernel CRNG
+state, userspace PRNGs, MAC address and any identity it generated: there is no
+entropy device, VM generation ID or restore notification on this path. Every
+load of one snapshot, and the VM that produced it if it is resumed, is a clone
+whose random output can coincide with the others until the guest reseeds. Load
+a snapshot only once, or have the guest reseed (`RNDADDENTROPY` /
+`RNDRESEEDCRNG` with fresh host entropy) and regenerate identity, keys and
+MAC-derived state after each restore, before it talks to the network. A cold
+boot gets fresh `rng-seed` and `kaslr-seed` values in `/chosen`.
+
 Restored disks are independent copies. The network backend restarts;
 applications must reconnect. For `unix-stream`, the current configuration
 must declare a compatible interface and the authorized switch socket;
