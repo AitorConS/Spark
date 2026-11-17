@@ -11,10 +11,12 @@ if not archive.exists():
     temporary=archive.with_suffix('.partial')
     with urllib.request.urlopen(lock['url'],timeout=60) as response, temporary.open('wb') as output:
         while chunk:=response.read(131072):output.write(chunk)
+    # Only a verified archive takes its final name.
+    if hashlib.sha256(temporary.read_bytes()).hexdigest()!=lock['sha256']:temporary.unlink();raise SystemExit('Go archive checksum mismatch')
     temporary.replace(archive)
 if hashlib.sha256(archive.read_bytes()).hexdigest()!=lock['sha256']:raise SystemExit('Go archive checksum mismatch')
 if not (work/'go/bin/go').exists():
-    with tarfile.open(archive) as source:source.extractall(work)
+    with tarfile.open(archive) as source:source.extractall(work,**({'filter':'data'} if hasattr(tarfile,'data_filter') else {}))
 version=subprocess.check_output([work/'go/bin/go','version'],text=True,env={**os.environ,'GOTOOLCHAIN':'local'})
 if version.split()[2]!=lock['version']:raise SystemExit('Go version mismatch')
 print(work/'go/bin/go')
