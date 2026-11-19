@@ -33,7 +33,15 @@ downloaded nor considered interchangeable with another version. Native sources
 are included in sources/, with the libslirp patch. GLib licenses are
 included in licenses/ and their original notices remain in the source file.
 
-The package has an ad-hoc signature, without notarization. The manifest distinguishes pre-signing Mach-O hashes
+The package has an ad-hoc signature, without notarization, and without the hardened
+runtime: with it, library validation refuses every bundled dylib, since ad-hoc
+signatures carry no Team ID and macOS treats the executable's and each library's
+as different ("mapping process and mapped file (non-platform) have different
+Team IDs"). The only way around that is the
+`com.apple.security.cs.disable-library-validation` entitlement, which would also
+reach the notarized build that shares `entitlements.plist`; `sign-notarize.sh`
+signs the executable and its libraries with one Developer ID and enables the
+hardened runtime there. The manifest distinguishes pre-signing Mach-O hashes
 and final checksums. Comparing two builds with clean native objects and separate Cargo targets
 confirmed equality of the three unsigned Mach-Os on this host/SDK.
 `verify-reproducible.py` repeats the check; it does not cover provenance metadata

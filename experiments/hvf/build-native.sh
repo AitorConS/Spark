@@ -15,5 +15,7 @@ output=${HVF_OUTPUT_DIR:-build/macos-arm64}
 target=${CARGO_TARGET_DIR:-build/cargo_target}
 mkdir -p "$output"
 cp "$target/aarch64-apple-darwin/release/firecracker" "$output/firecracker"
+# Ad-hoc, without the hardened runtime: its library validation would refuse
+# GLib, whose ad-hoc signature has no Team ID (see distribution/README.md).
 codesign --force --sign - --entitlements experiments/hvf/entitlements.plist "$output/firecracker"
 file "$output/firecracker"
