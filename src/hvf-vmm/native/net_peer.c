@@ -185,8 +185,10 @@ int net_peer_poll(void){
             p->deferred=0;moved++;
         }
         for(unsigned budget=0;budget<PEER_RX_BUDGET;budget++){
-            ssize_t n=recv(p->fd,p->buf,PEER_FRAME,MSG_DONTWAIT);
+            int passed;ssize_t n=fd_recv_data(p->fd,p->buf,PEER_FRAME,MSG_DONTWAIT,&passed);
             if(n<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)peer_dead(p);break;}
+            // Frames never carry descriptors: those passed were closed, and the peer is done.
+            if(passed){invalid_drops++;peer_dead(p);break;}
             if(n<PEER_HDR||!net_frame_source_valid(p->buf+PEER_HDR,(size_t)n-PEER_HDR,p->mac,p->ip)){invalid_drops++;continue;}
             rx_frames++;rx_bytes+=(uint64_t)n-PEER_HDR;p->active=now_ms();p->idle=0;
             // The guest RX ring is shared by every source: stop when it is full

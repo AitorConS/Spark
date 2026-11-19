@@ -5,6 +5,7 @@
 #include "socket_gate.h"
 #include "policy.h"
 #include "seatbelt.h"
+#include "fd_recv.h"
 #include <sys/uio.h>
 #include <netinet/tcp.h>
 #include <sys/wait.h>
@@ -122,10 +123,11 @@ respond:;
 static void udp_poll(struct udp *slot,int outgoing,int incoming,unsigned *remaining){
     uint8_t bytes[65536];struct datagram header={.magic=UDP_MAGIC};
     if(outgoing)for(unsigned budget=0;budget<16 && *remaining;budget++,--*remaining){
-        struct iovec iov[2]={{&header,sizeof(header)},{bytes,65507}};struct msghdr message={.msg_iov=iov,.msg_iovlen=2};
-        ssize_t n=recvmsg(slot->ipc,&message,MSG_DONTWAIT);
+        // The broker passes no descriptors here; any it does are closed with the datagram.
+        struct iovec iov[2]={{&header,sizeof(header)},{bytes,65507}};int flags,passed;
+        ssize_t n=fd_recv_none(slot->ipc,iov,2,MSG_DONTWAIT,&flags,&passed);
         if(n<0)break;
-        if(n<(ssize_t)sizeof(header)||(message.msg_flags&MSG_TRUNC)||header.magic!=UDP_MAGIC||header.address.sin_family!=AF_INET)continue;
+        if(passed||n<(ssize_t)sizeof(header)||(flags&MSG_TRUNC)||header.magic!=UDP_MAGIC||header.address.sin_family!=AF_INET)continue;
         int allowed=hvf_policy_allows(SOCK_DGRAM,&header.address,0);
         if(!allowed)for(unsigned i=0;i<32;i++)if(slot->peers[i].expires>now()&&same(&slot->peers[i].address,&header.address)){allowed=1;break;}
         if(allowed)(void)sendto(slot->net,bytes,n-sizeof(header),MSG_DONTWAIT,(const void *)&header.address,sizeof(header.address));
@@ -184,7 +186,8 @@ int hvf_gate_wait(void){
     int fd=starting;pid_t child=authority_pid;starting=-1;
     if(fd<0){errno=EPROTO;return -1;}
     struct pollfd ready={fd,POLLIN,0};struct reply reply;
-    if(poll(&ready,1,2000)<=0 || recv(fd,&reply,sizeof(reply),MSG_DONTWAIT)!=sizeof(reply) || reply.magic!=MAGIC || reply.id || reply.error){
+    int passed=0;
+    if(poll(&ready,1,2000)<=0 || fd_recv_data(fd,&reply,sizeof(reply),MSG_DONTWAIT,&passed)!=sizeof(reply) || passed || reply.magic!=MAGIC || reply.id || reply.error){
         // A confined parent may not be allowed the kill: the authority also
         // exits on its own once this process, which gives up on it, is gone.
         authority_pid=0;close(fd);kill(child,SIGKILL);while(waitpid(child,NULL,0)<0&&errno==EINTR){}errno=EPROTO;return -1;
@@ -219,11 +222,11 @@ static int rpc(uint32_t op,uint32_t token,const struct sockaddr_in *address,stru
         remaining=2000-(int)elapsed;
     }
     if(result<=0)return rpc_failed(result==0?ETIMEDOUT:errno,descriptor);
-    char ancillary[CMSG_SPACE(sizeof(int))]={0};struct iovec iov={reply,sizeof(*reply)};struct msghdr message={.msg_iov=&iov,.msg_iovlen=1,.msg_control=ancillary,.msg_controllen=sizeof(ancillary)};
+    char ancillary[FD_RECV_SPACE]={0};struct iovec iov={reply,sizeof(*reply)};struct msghdr message={.msg_iov=&iov,.msg_iovlen=1,.msg_control=ancillary,.msg_controllen=sizeof(ancillary)};
     ssize_t n;
     do{n=recvmsg(channel,&message,MSG_DONTWAIT);}while(n<0&&errno==EINTR);
-    for(struct cmsghdr *c=CMSG_FIRSTHDR(&message);c;c=CMSG_NXTHDR(&message,c))if(c->cmsg_level==SOL_SOCKET&&c->cmsg_type==SCM_RIGHTS&&c->cmsg_len==CMSG_LEN(sizeof(int)))memcpy(descriptor,CMSG_DATA(c),sizeof(int));
-    if(n!=sizeof(*reply)||(message.msg_flags&(MSG_TRUNC|MSG_CTRUNC))||reply->magic!=MAGIC||reply->id!=request.id)return rpc_failed(n<0?errno:EPROTO,descriptor);
+    unsigned passed=n<0?0:fd_recv_collect(&message,descriptor);
+    if(n!=sizeof(*reply)||passed>1||(message.msg_flags&(MSG_TRUNC|MSG_CTRUNC))||reply->magic!=MAGIC||reply->id!=request.id)return rpc_failed(n<0?errno:EPROTO,descriptor);
     // ACK failure is fatal: the authority must not retain an unacknowledged
     // socket while the broker continues using the synchronous channel.
     if(*descriptor>=0&&(op==1||op==2||op==3)){
@@ -314,13 +317,13 @@ static ssize_t gate_fault(int fd,const char *reason){
     errno=ENOTCONN;return -1;
 }
 ssize_t hvf_gate_recv(int fd,void *data,size_t size,int flags,struct sockaddr *address,socklen_t *length){
-    struct datagram header={0};struct iovec iov[2]={{&header,sizeof(header)},{data,size}};struct msghdr message={.msg_iov=iov,.msg_iovlen=2};ssize_t n=recvmsg(fd,&message,flags|MSG_DONTWAIT);
+    struct datagram header={0};struct iovec iov[2]={{&header,sizeof(header)},{data,size}};int passed;ssize_t n=fd_recv_none(fd,iov,2,flags|MSG_DONTWAIT,NULL,&passed);
     // Compatibility mitigation for observed receive errors. UDP data envelopes
     // carry no SCM_RIGHTS; transient FD-transfer probes do not establish the
     // cause here. libslirp must handle EAGAIN without emitting an ICMP error.
     if(n<0&&(errno==EMSGSIZE||errno==EPROTOTYPE))return gate_fault(fd,"host receive error");
     if(n<0)return -1;
-    if(n<(ssize_t)sizeof(header)||header.magic!=UDP_MAGIC||header.address.sin_family!=AF_INET)return gate_fault(fd,"invalid envelope");
+    if(passed||n<(ssize_t)sizeof(header)||header.magic!=UDP_MAGIC||header.address.sin_family!=AF_INET)return gate_fault(fd,"invalid envelope");
     if(fd>=0&&fd<MAX_FD)client_faults[fd]=client_streak[fd]=0;
     if(address&&length){size_t copy=*length<sizeof(header.address)?*length:sizeof(header.address);memcpy(address,&header.address,copy);*length=sizeof(header.address);}return n-sizeof(header);
 }

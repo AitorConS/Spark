@@ -35,3 +35,19 @@ static inline unsigned fd_recv_collect(struct msghdr *h,int *keep){
     }
     return count;
 }
+// recvmsg() on a channel that never carries descriptors. Any it did carry are
+// closed and *passed is set to 1 (MSG_CTRUNC counts: some could not be seen);
+// otherwise *passed is 0. msg_flags, when not NULL, receives the message flags.
+static inline ssize_t fd_recv_none(int fd,struct iovec *iov,int count,int flags,int *msg_flags,int *passed){
+    char space[FD_RECV_SPACE];
+    struct msghdr h={.msg_iov=iov,.msg_iovlen=count,.msg_control=space,.msg_controllen=sizeof(space)};
+    ssize_t n=recvmsg(fd,&h,flags);
+    *passed=n>=0&&(fd_recv_collect(&h,NULL)||(h.msg_flags&MSG_CTRUNC));
+    if(msg_flags)*msg_flags=n>=0?h.msg_flags:0;
+    return n;
+}
+// recv() with the same guarantee.
+static inline ssize_t fd_recv_data(int fd,void *buffer,size_t size,int flags,int *passed){
+    struct iovec io={buffer,size};
+    return fd_recv_none(fd,&io,1,flags,NULL,passed);
+}

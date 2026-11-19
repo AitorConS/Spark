@@ -5,6 +5,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <errno.h>
+#include "fd_recv.h"
 // Wire bytes, never a native struct: magic, version, kind, reserved, LE operation.
 struct control_reader { uint8_t bytes[16]; size_t used; };
 static int control_send(int fd, uint8_t kind, uint64_t operation) {
@@ -14,9 +15,9 @@ static int control_send(int fd, uint8_t kind, uint64_t operation) {
 }
 // 1: complete frame; 0: incomplete/would block; -1: disconnected/invalid.
 static int control_receive(int fd, struct control_reader *r, uint8_t *kind, uint64_t *operation) {
-    ssize_t n=recv(fd,r->bytes+r->used,sizeof(r->bytes)-r->used,MSG_DONTWAIT);
+    int passed;ssize_t n=fd_recv_data(fd,r->bytes+r->used,sizeof(r->bytes)-r->used,MSG_DONTWAIT,&passed);
     if(n<0)return (errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR) ? 0 : -1;
-    if(!n)return -1;
+    if(!n||passed)return -1;
     r->used+=(size_t)n;
     if(r->used<sizeof(r->bytes))return 0;
     r->used=0;

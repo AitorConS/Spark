@@ -133,9 +133,9 @@ static void broker_main(const struct hvf_options *options){
                 last_operation=operation;
                 // Sender has stopped guest TX before P; drain its finite IPC queue.
                 if(kind=='P'){
-                    for(;;){ssize_t bytes=recv(frames,packet,sizeof(packet),MSG_DONTWAIT);
+                    for(;;){int passed;ssize_t bytes=fd_recv_data(frames,packet,sizeof(packet),MSG_DONTWAIT,&passed);
                         if(bytes<0){if(errno==EINTR)continue;if(errno!=EAGAIN&&errno!=EWOULDBLOCK)goto done;break;}
-                        if(bytes<14||bytes>65536)goto done;
+                        if(passed||bytes<14||bytes>65536)goto done;
                         if(is_stream)stream_send(packet,(size_t)bytes);else slirp_backend_send(packet,(size_t)bytes);
                     }
                 }
@@ -171,9 +171,10 @@ static void broker_main(const struct hvf_options *options){
         for(unsigned budget=0;budget<256;budget++){
             // While the VMM owns the link it sends nothing here; drain stragglers.
             if(is_stream && !direct && !stream_can_send())break;
-            ssize_t n=recv(frames,packet,sizeof(packet),MSG_DONTWAIT);
+            // Descriptors on the frame channel are a protocol violation, like a bad length.
+            int passed;ssize_t n=fd_recv_data(frames,packet,sizeof(packet),MSG_DONTWAIT,&passed);
             if(n<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)goto done;break;}
-            if(n<14||n>65536)goto done;
+            if(passed||n<14||n>65536)goto done;
             if(is_stream&&direct){stream.drops++;stream.drop_bytes+=(uint64_t)n;}
             else if(is_stream)stream_send(packet,(size_t)n);else slirp_backend_send(packet,(size_t)n);
         }
@@ -270,8 +271,9 @@ void net_backend_poll(void){
     }
     if(deferred_size){if(receive_frame(deferred_frame,deferred_size,NULL)<0)return;deferred_size=0;}
     for(unsigned budget=0;budget<256;budget++){
-        ssize_t n=recv(frames,packet,sizeof(packet),MSG_DONTWAIT);
+        int passed;ssize_t n=fd_recv_data(frames,packet,sizeof(packet),MSG_DONTWAIT,&passed);
         if(n<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)fail("broker receive failed");break;}
+        if(passed)fail("broker passed descriptors with a frame");
         if(n<14||n>65536)fail("invalid broker frame");
         if(receive_frame(packet,(size_t)n,NULL)<0){memcpy(deferred_frame,packet,(size_t)n);deferred_size=(size_t)n;break;}
     }
@@ -333,8 +335,8 @@ int net_backend_pending_rx(void){
 
 void net_backend_metrics(uint64_t out[7]){
     if(stats>=0)for(unsigned budget=0;budget<8;budget++){
-        uint8_t packet[49];ssize_t n=recv(stats,packet,sizeof(packet),MSG_DONTWAIT);if(n<0)break;
-        if(n!=48 || memcmp(packet,"HVDP\1\5\0\0",8))continue;
+        uint8_t packet[49];int passed;ssize_t n=fd_recv_data(stats,packet,sizeof(packet),MSG_DONTWAIT,&passed);if(n<0)break;
+        if(passed || n!=48 || memcmp(packet,"HVDP\1\5\0\0",8))continue;
         uint64_t values[5]={0};for(unsigned i=0;i<5;i++)for(unsigned j=0;j<8;j++)values[i]|=(uint64_t)packet[8+i*8+j]<<(8*j);
         rx_drops=values[0];rx_drop_bytes=values[1];stats_drops=values[2];stream_drops=values[3];stream_drop_bytes=values[4];
     }

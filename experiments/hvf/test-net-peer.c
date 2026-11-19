@@ -4,6 +4,7 @@
 #include "net_peer.h"
 #include "net_peer_relay.h"
 #include "net_link.h"
+#include "control.h"
 #include "seatbelt.h"
 #include <sys/wait.h>
 #include <fcntl.h>
@@ -83,7 +84,7 @@ static void send_descriptors(int fd,const void *data,size_t size,unsigned count)
     struct msghdr h={.msg_iov=&io,.msg_iovlen=1,.msg_control=space,.msg_controllen=CMSG_SPACE(count*sizeof(int))};
     struct cmsghdr *c=CMSG_FIRSTHDR(&h);c->cmsg_level=SOL_SOCKET;c->cmsg_type=SCM_RIGHTS;c->cmsg_len=CMSG_LEN(count*sizeof(int));
     memcpy(CMSG_DATA(c),fds,count*sizeof(int));
-    assert(sendmsg(fd,&h,0)==(ssize_t)size);
+    if(sendmsg(fd,&h,0)!=(ssize_t)size){fprintf(stderr,"send_descriptors: %s\n",strerror(errno));abort();}
     for(unsigned i=0;i<count;i++)close(fds[i]);
 }
 // The other VMM sizes its end the same way (unix datagram buffers default to a few KB).
@@ -531,6 +532,66 @@ static void test_relay_descriptor_flood(void){
     close(sw);close(listener);unlink(path);rmdir(directory);
     relay.channel=-1;relay.path=NULL;close(channel[0]);close(channel[1]);
 }
+// Data channels never carry descriptors, but XNU installs any a datagram
+// carries even into a plain recv(). Receivers close them; a peer that sends
+// them is dropped.
+static void test_data_descriptors(void){
+    int pair[2];assert(!socketpair(AF_UNIX,SOCK_DGRAM,0,pair));size_link(pair[0]);size_link(pair[1]);
+    unsigned before=open_descriptors();
+    // In batches: XNU bounds how many descriptors may be in flight.
+    for(unsigned i=0;i<100;i++){
+        send_descriptors(pair[1],"frame",5,1+i%3);
+        if(i%10<9)continue;
+        for(unsigned j=0;j<10;j++){
+            char got[8];int passed=0;
+            assert(fd_recv_data(pair[0],got,sizeof(got),MSG_DONTWAIT,&passed)==5&&passed);
+        }
+    }
+    char got[8];int passed=1;
+    assert(send(pair[1],"plain",5,0)==5&&fd_recv_data(pair[0],got,sizeof(got),0,&passed)==5&&!passed);
+    assert(open_descriptors()==before);
+    close(pair[0]);close(pair[1]);
+
+    // The supervisor/broker control stream: a frame with a descriptor is invalid.
+    assert(!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
+    before=open_descriptors();
+    uint8_t frame[16]={'H','V','F','C',1,'A'};
+    struct control_reader reader={0};uint8_t kind;uint64_t operation;
+    assert(!control_send(pair[1],'A',1)&&control_receive(pair[0],&reader,&kind,&operation)==1&&kind=='A');
+    send_descriptors(pair[1],frame,sizeof(frame),4);
+    assert(control_receive(pair[0],&reader,&kind,&operation)==-1);
+    assert(open_descriptors()==before);
+    close(pair[0]);close(pair[1]);
+
+    // A peer that passes descriptors with its frames is reported dead.
+    int channel[2],link[2];
+    assert(!socketpair(AF_UNIX,SOCK_DGRAM,0,channel)&&!socketpair(AF_UNIX,SOCK_DGRAM,0,link));
+    set_timeout(channel[1]);size_link(link[1]);
+    net_peer_open(channel[0],self_mac,deliver);
+    struct peer_message welcome={.type=PEER_WELCOME,.epoch=23};memcpy(welcome.mac,self_mac,6);memcpy(welcome.ip,self_ip,4);
+    struct peer_message add={.type=PEER_ADD,.epoch=23,.value=6};memcpy(add.mac,peer_mac,6);memcpy(add.ip,peer_ip,4);
+    send_message(channel[1],&welcome,-1);send_message(channel[1],&add,link[0]);close(link[0]);
+    net_peer_poll();
+    struct peer_message m;assert(read_message(channel[1],&m)<0&&m.type==PEER_ACK&&m.flags==1);
+    before=open_descriptors();unsigned seen=deliveries;
+    uint8_t f[210];size_t size=vipv4(f,self_mac,peer_mac,peer_ip,200);
+    for(unsigned i=0;i<10;i++)send_descriptors(link[1],f,size,1);
+    net_peer_poll();
+    // Nothing delivered, every received descriptor closed, and the link itself released.
+    assert(deliveries==seen&&open_descriptors()==before-1);
+    do assert(read_message(channel[1],&m)<0); while(m.type==PEER_STATS);
+    assert(m.type==PEER_DEAD&&m.value==6);
+    net_peer_close();close(channel[1]);close(link[1]);
+
+    // The broker's relay ignores a VMM message that passes descriptors.
+    assert(!socketpair(AF_UNIX,SOCK_DGRAM,0,channel));
+    relay.channel=channel[0];relay.ctl=-1;relay.path=NULL;relay.reset_owed=0;
+    before=open_descriptors();
+    uint8_t wire[PEER_MESSAGE];peer_encode(wire,&(struct peer_message){.type=PEER_ACK,.epoch=23,.value=6});
+    for(unsigned i=0;i<100;i++){send_descriptors(channel[1],wire,sizeof(wire),1);if(i%10==9)relay_service();}
+    assert(open_descriptors()==before);
+    relay.channel=-1;close(channel[0]);close(channel[1]);
+}
 int main(void){
     test_source_contract();
     test_protocol();
@@ -542,6 +603,7 @@ int main(void){
     test_sandboxed_vmm();
     test_descriptor_flood();
     test_relay_descriptor_flood();
+    test_data_descriptors();
     puts("net-peer: ok");
     return 0;
 }

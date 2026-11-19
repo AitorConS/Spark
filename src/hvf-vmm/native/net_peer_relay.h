@@ -126,10 +126,10 @@ static void relay_from_switch(void){
 static void relay_from_vmm(void){
     for(unsigned budget=0;budget<64;budget++){
         uint8_t wire[PEER_MESSAGE+1];
-        ssize_t n=recv(relay.channel,wire,sizeof(wire),MSG_DONTWAIT);
+        int passed;ssize_t n=fd_recv_data(relay.channel,wire,sizeof(wire),MSG_DONTWAIT,&passed);
         if(n<0)return;
         struct peer_message m;
-        if(n!=PEER_MESSAGE||peer_decode(wire,&m)||(m.type!=PEER_ACK&&m.type!=PEER_DEAD&&m.type!=PEER_STATS&&m.type!=PEER_IDLE))continue;
+        if(passed||n!=PEER_MESSAGE||peer_decode(wire,&m)||(m.type!=PEER_ACK&&m.type!=PEER_DEAD&&m.type!=PEER_STATS&&m.type!=PEER_IDLE))continue;
         if(m.type==PEER_ACK)relay_release(m.value);
         if(relay.ctl>=0&&!relay.connecting&&relay_to_switch(&m))return;
     }
