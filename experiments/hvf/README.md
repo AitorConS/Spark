@@ -84,6 +84,15 @@ VMM capacity does not imply that any guest fits in 64 MiB.
 The Linux example is validated with 256 MiB. Output-only PL011 console, GICv3, PSCI,
 legacy VirtIO PCI and MMIO fw_cfg. No interactive input console is offered.
 
+The console is written to the VMM's stdout byte for byte, unfiltered. The
+guest's writes go into a 256 KiB buffer that the device loop empties without
+blocking, so a stdout nobody reads never stalls a vCPU, pause or the
+watchdog. While the buffer is full, newer console bytes are dropped; once
+stdout takes bytes again the VMM's log (stderr) gets one line `HVF: guest
+console dropped N bytes while its output was not read` (at most every five
+seconds). At exit the VMM waits up to one second for stdout to take what is
+left. If stdout fails (a closed pipe), further output is discarded.
+
 ## Generic configuration
 
 ```json
@@ -134,7 +143,9 @@ not the host's loopback nor private (10/8, 172.16/12, 192.168/16), shared
 (100.64/10), link-local (169.254/16), multicast or reserved addresses, nor
 the special-purpose blocks that are not globally reachable (192.0.0/24 used by
 464XLAT, 192.0.2/24, 192.88.99/24, 198.18/15 used by VPN and fake-IP
-interfaces, 198.51.100/24, 203.0.113/24). It
+interfaces, 198.51.100/24, 203.0.113/24), nor any address of the host's own
+interfaces or on their IPv4 subnets, even a public one. A UDP socket the guest
+did not declare as a listener receives only from endpoints it has sent to. It
 names no resolver: `dns` still does, and may be a private address. slirp provides NAT/DHCP/DNS on
 `10.0.2.0/24` (gateway `.2`, DNS `.3`, DHCP from `.15`). The transport is behind
 `net_backend.h`, separate from VirtIO; it supports slirp and the generic
@@ -405,6 +416,22 @@ Restored disks are independent copies. The network backend restarts;
 applications must reconnect. For `unix-stream`, the current configuration
 must declare a compatible interface and the authorized switch socket;
 see [the restore contract](UNIX_STREAM.md).
+
+A snapshot restores what the guest sees, never what the host grants it. The
+security policy (including `mode`), the forwarded host ports, the `limits` and
+the `hvf` options come from the restoring supervisor's current configuration,
+as set by its configuration file and by `PUT /security`, `/network-interfaces`,
+`/limits` and `/hvf` before `/snapshot/load`; those saved in the manifest are
+ignored. The manifest is not covered by the component hashes, so this is what
+stops an edited snapshot from turning off Seatbelt, publishing host ports or
+raising its own limits. A supervisor that configured none of them restores with
+the defaults: deny-all policy, no forwards, default limits. The interface's ID,
+MAC and MTU stay the snapshot's; a declared interface with another ID, MAC or
+backend is refused, and a slirp interface restored without a declared one has
+no forwards. When a section differed, the supervisor logs which ones it took
+from its own configuration. Earlier builds adopted the snapshot's policy,
+forwards, limits and options for slirp snapshots, and its limits and options
+for `unix-stream` ones.
 Manifests with invalid format, paths or sizes are rejected with HTTP 400
 before accepting the operation; component integrity is checked
 during async restore. No application transactional consistency,

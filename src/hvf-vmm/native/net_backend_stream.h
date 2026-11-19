@@ -12,6 +12,7 @@
 #include <time.h>
 #include <string.h>
 #include "net_backend.h"
+#include "fd_recv.h"
 #define STREAM_FRAME 65536u
 #define STREAM_RX_CAPACITY (2u * (STREAM_FRAME + 4u))
 // macOS gives Unix stream sockets 8 KiB buffers, less than one 9000-byte frame,
@@ -195,9 +196,10 @@ static void stream_poll(void) {
             stream.rx_start=0;tail_free=sizeof(stream.rx)-stream.rx_used;
         }
         if(!tail_free){stream_disconnect();return;}
-        ssize_t n=recv(stream.fd,stream.rx+stream.rx_start+stream.rx_used,tail_free,0);
+        // The switch passes no descriptors on a link: any it does end the link.
+        int passed;ssize_t n=fd_recv_data(stream.fd,stream.rx+stream.rx_start+stream.rx_used,tail_free,0,&passed);
         if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return;
-        if(n<=0){stream_disconnect();return;}
+        if(n<=0||passed){stream_disconnect();return;}
         stream.rx_used+=(size_t)n;stream.progress=stream_ms();
     }
 }

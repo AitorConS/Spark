@@ -107,7 +107,7 @@ struct Network {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mtu: Option<u32>,
 }
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Forward {
     protocol: String,

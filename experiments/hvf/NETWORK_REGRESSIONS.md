@@ -19,6 +19,18 @@ nor is HEAD used as baseline of this shared checkout.
   previous version of that mechanism.
 - `test-network-{gate,fd,port}.py` retain the previous ICMP discriminants,
   TCP release and port collisions.
+- `sh experiments/hvf/test-net-peer.sh`: AddressSanitizer test of the direct-link
+  data plane, the peer relay and the broker/VMM link channel. Among its cases, a
+  message carrying eight descriptors where one is expected, and one carrying more
+  than any control buffer holds (`MSG_CTRUNC`, with `cmsg_len` past the buffer):
+  the receiver reads only what fits, closes every descriptor it sees (its count of
+  open descriptors is unchanged but for the channel it fails) and fails that
+  channel. Descriptors beyond the buffer are installed by XNU but cannot be seen,
+  which is why every buffer has room for 16. XNU also installs descriptors that
+  a datagram carries into a plain `recv()`: every data and control channel
+  receives through `fd_recv.h`, which closes them, and the test checks that 100
+  such datagrams leave the receiver's descriptor count unchanged and that a peer
+  sending them is reported dead.
 - `sh experiments/hvf/test-net-irq.sh`: AddressSanitizer/UndefinedBehaviorSanitizer
   test of native virtio-net queue completions. It checks Nanos-style polling TX
   suppression, re-armed TX/RX wakeups, ISR acknowledgement, redundant GIC calls,

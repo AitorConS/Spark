@@ -13,6 +13,8 @@ static struct peer peers[1024];
 static unsigned next_peer;
 static const struct hvf_security deny_all={0};
 static const struct hvf_security *policy=&deny_all;
+static int (*host_local)(const struct in_addr *);
+void hvf_policy_set_local(int (*check)(const struct in_addr *)){host_local=check;}
 void hvf_policy_set(const struct hvf_security *value){policy=value?value:&deny_all;}
 static int denied(void){errno=EPERM;return -1;}
 static int socket_type(int fd){int value=0;socklen_t n=sizeof(value);return getsockopt(fd,SOL_SOCKET,SO_TYPE,&value,&n)?-1:value;}
@@ -48,7 +50,7 @@ int hvf_policy_allows(int type,const struct sockaddr_in *v4,int listener){
     if(!v4||v4->sin_family!=AF_INET||(type!=SOCK_DGRAM&&type!=SOCK_STREAM))return 0;
     if(listener)return match(policy->listeners,policy->listener_count,type,v4);
     if(policy->dns_port && policy->dns_port==ntohs(v4->sin_port) && !memcmp(policy->dns_address,&v4->sin_addr,4))return 1;
-    if(policy->public_egress && v4->sin_port && hvf_policy_public(&v4->sin_addr))return 1;
+    if(policy->public_egress && v4->sin_port && hvf_policy_public(&v4->sin_addr) && !(host_local&&host_local(&v4->sin_addr)))return 1;
     return match(policy->egress,policy->egress_count,type,v4);
 }
 static int authorized(int fd,const struct sockaddr *address,socklen_t length,int listener){

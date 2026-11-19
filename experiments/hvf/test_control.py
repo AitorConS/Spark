@@ -66,6 +66,36 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(api(self.sock,'PUT','/actions',{'action_type':'ForceStop'})[0],202)
         self.wait_state('Exited')
 
+    def test_unread_console_does_not_stall_the_vm(self):
+        # The guest writes the UART forever; the supervisor's stdout is a pipe
+        # nobody reads. Console bytes must be dropped, not block the vCPU with
+        # the device lock held: pause, resume and stop keep working.
+        self.p.terminate();self.p.wait(timeout=4);self.sock.unlink(missing_ok=True)
+        self.p=subprocess.Popen([str(BINARY),'--api-sock',str(self.sock)],env={**os.environ,'TMPDIR':str(self.runtime)},stdout=subprocess.PIPE,stderr=self.log)
+        deadline=time.monotonic()+3
+        while not self.sock.exists():
+            self.assertLess(time.monotonic(),deadline);time.sleep(.01)
+        self.put('/boot-source',{'kernel_image_path':str(self.kernel)})
+        # mov x1,#0x09000000; mov w0,#'H'; str w0,[x1]; b .-4
+        self.kernel.write_bytes(elf([0xd2a12001,0x52800900,0xb9000020,0x17ffffff]))
+        self.start();time.sleep(1)
+        for _ in range(3):
+            self.assertEqual(api(self.sock,'PUT','/actions',{'action_type':'Pause'})[0],202)
+            self.wait_state('Paused')
+            self.assertEqual(api(self.sock,'PUT','/actions',{'action_type':'Resume'})[0],202)
+            self.wait_state('Running')
+        # Reading again lets the ring drain: the drop is reported in the VMM's
+        # log, and what does arrive is exactly what the guest wrote.
+        def log():return b''.join(path.read_bytes() for path in self.runtime.rglob('startup.log'))
+        os.set_blocking(self.p.stdout.fileno(),False);got=b'';deadline=time.monotonic()+5
+        while b'guest console dropped' not in log():
+            self.assertLess(time.monotonic(),deadline)
+            got+=self.p.stdout.read() or b'';time.sleep(.01)
+        self.assertTrue(got and set(got)=={ord('H')},got[:64])
+        self.assertEqual(api(self.sock,'PUT','/actions',{'action_type':'ForceStop'})[0],202)
+        self.wait_state('Exited')
+        self.p.stdout.close()
+
     def test_pause_freezes_virtual_counter(self):
         # CNTVCT loop resets via PSCI if consecutive samples differ by >1 second.
         self.kernel.write_bytes(elf([0xd53be002,0xd53be043,0xd53be044,0xcb030085,

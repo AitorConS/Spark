@@ -396,10 +396,7 @@ fn serve_inner(socket: &Path, initial: Option<Config>, headless: bool) -> Result
                     }
                     let create = request.path == "/snapshot/create";
                     if !create {
-                        crate::snapshot::validate_restore_network(
-                            &request_body.snapshot_path,
-                            &config,
-                        )?;
+                        crate::snapshot::validate_restore(&request_body.snapshot_path, &config)?;
                     }
                     if snapshot_task.is_some()
                         || pending.is_some()

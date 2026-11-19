@@ -4,6 +4,7 @@
 // Messages and descriptors cross the broker/VMM channel as single datagrams.
 #pragma once
 #include "peer_proto.h"
+#include "fd_recv.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -91,20 +92,16 @@ static void relay_release(uint64_t id){
 static void relay_from_switch(void){
     // Bounded per call like the other loops; the rest waits for the next pass.
     for(unsigned budget=0;budget<4*64;budget++){
-        char space[CMSG_SPACE(4*sizeof(int))];
+        char space[FD_RECV_SPACE];
         struct iovec io={relay.in+relay.used,PEER_MESSAGE-relay.used};
         struct msghdr h={.msg_iov=&io,.msg_iovlen=1,.msg_control=space,.msg_controllen=sizeof(space)};
         ssize_t n=recvmsg(relay.ctl,&h,MSG_DONTWAIT);
         if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return;
-        int invalid=n<=0||(h.msg_flags&MSG_CTRUNC);
-        for(struct cmsghdr *c=CMSG_FIRSTHDR(&h);c;c=CMSG_NXTHDR(&h,c)){
-            if(c->cmsg_level!=SOL_SOCKET||c->cmsg_type!=SCM_RIGHTS)continue;
-            size_t count=(c->cmsg_len-CMSG_LEN(0))/sizeof(int);
-            for(size_t i=0;i<count;i++){
-                int fd;memcpy(&fd,CMSG_DATA(c)+i*sizeof(int),sizeof(fd));
-                if(relay.pending_fd<0)relay.pending_fd=fd;else{close(fd);invalid=1;}
-            }
-        }
+        // Only what fits in the buffer is read; MSG_CTRUNC means more was
+        // installed than seen. Either way, extras end the switch session.
+        int passed=-1;unsigned count=n<0?0:fd_recv_collect(&h,&passed);
+        int invalid=n<=0||(h.msg_flags&MSG_CTRUNC)||count>1||(passed>=0&&relay.pending_fd>=0);
+        if(passed>=0){if(relay.pending_fd<0)relay.pending_fd=passed;else close(passed);}
         if(invalid){relay_disconnect();return;}
         relay.used+=(size_t)n;
         if(relay.used<PEER_MESSAGE)continue;
@@ -129,10 +126,10 @@ static void relay_from_switch(void){
 static void relay_from_vmm(void){
     for(unsigned budget=0;budget<64;budget++){
         uint8_t wire[PEER_MESSAGE+1];
-        ssize_t n=recv(relay.channel,wire,sizeof(wire),MSG_DONTWAIT);
+        int passed;ssize_t n=fd_recv_data(relay.channel,wire,sizeof(wire),MSG_DONTWAIT,&passed);
         if(n<0)return;
         struct peer_message m;
-        if(n!=PEER_MESSAGE||peer_decode(wire,&m)||(m.type!=PEER_ACK&&m.type!=PEER_DEAD&&m.type!=PEER_STATS&&m.type!=PEER_IDLE))continue;
+        if(passed||n!=PEER_MESSAGE||peer_decode(wire,&m)||(m.type!=PEER_ACK&&m.type!=PEER_DEAD&&m.type!=PEER_STATS&&m.type!=PEER_IDLE))continue;
         if(m.type==PEER_ACK)relay_release(m.value);
         if(relay.ctl>=0&&!relay.connecting&&relay_to_switch(&m))return;
     }

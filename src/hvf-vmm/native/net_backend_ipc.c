@@ -40,52 +40,13 @@ static int broker_stream;
 // connects, and the VMM asks it for a new link when one fails. Each handoff
 // carries a generation; the broker keeps its reference until the VMM
 // acknowledges it, as XNU can collect a socket that is only in flight.
-#define LINK_MESSAGE 16
-enum {LINK_OFFER='S',LINK_ACK='A',LINK_LOST='R'};
+#include "net_link.h"
 static uint64_t link_generation;   // VMM: generation of the adopted link (0: none)
 static int link_lost;              // VMM: LINK_LOST sent for link_generation
 // VMM: polls that ended inside a frame. A switch whose socket buffer is smaller
 // than a frame (older jerboad: 8 KiB) leaves one there every time.
 static unsigned link_partial_polls;
 #define LINK_PARTIAL_POLLS 32
-static int link_message(int fd,uint8_t kind,uint64_t generation,int descriptor){
-    uint8_t wire[LINK_MESSAGE]={'H','V','L','K',kind};
-    for(unsigned i=0;i<8;i++)wire[8+i]=(uint8_t)(generation>>(8*i));
-    char space[CMSG_SPACE(sizeof(int))];
-    struct iovec io={wire,sizeof(wire)};
-    struct msghdr h={.msg_iov=&io,.msg_iovlen=1};
-    if(descriptor>=0){
-        memset(space,0,sizeof(space));h.msg_control=space;h.msg_controllen=sizeof(space);
-        struct cmsghdr *c=CMSG_FIRSTHDR(&h);c->cmsg_level=SOL_SOCKET;c->cmsg_type=SCM_RIGHTS;c->cmsg_len=CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(c),&descriptor,sizeof(descriptor));
-    }
-    return sendmsg(fd,&h,MSG_DONTWAIT)==(ssize_t)sizeof(wire)?0:-1;
-}
-// Returns 1 with a message (and *descriptor, or -1), 0 when none is queued.
-static int link_receive(int fd,uint8_t *kind,uint64_t *generation,int *descriptor){
-    // Bounded: a flood of invalid datagrams must not keep the device loop here.
-    for(unsigned budget=0;budget<64;budget++){
-        uint8_t wire[LINK_MESSAGE+1];char space[CMSG_SPACE(sizeof(int))];
-        struct iovec io={wire,sizeof(wire)};
-        struct msghdr h={.msg_iov=&io,.msg_iovlen=1,.msg_control=space,.msg_controllen=sizeof(space)};
-        ssize_t n=recvmsg(fd,&h,MSG_DONTWAIT);
-        if(n<0)return 0;
-        *descriptor=-1;
-        for(struct cmsghdr *c=CMSG_FIRSTHDR(&h);c;c=CMSG_NXTHDR(&h,c)){
-            if(c->cmsg_level!=SOL_SOCKET||c->cmsg_type!=SCM_RIGHTS)continue;
-            size_t count=(c->cmsg_len-CMSG_LEN(0))/sizeof(int);
-            for(size_t i=0;i<count;i++){
-                int received;memcpy(&received,CMSG_DATA(c)+i*sizeof(int),sizeof(received));
-                if(*descriptor<0)*descriptor=received;else close(received);
-            }
-        }
-        if(n!=LINK_MESSAGE||(h.msg_flags&MSG_CTRUNC)||memcmp(wire,"HVLK",4)){if(*descriptor>=0)close(*descriptor);continue;}
-        *kind=wire[4];*generation=0;
-        for(unsigned i=0;i<8;i++)*generation|=(uint64_t)wire[8+i]<<(8*i);
-        return 1;
-    }
-    return 0;
-}
 static void fail(const char *message){fprintf(stderr,"network IPC: %s\n",message);exit(2);}
 static ssize_t broker_deliver(const void *data,size_t size,void *opaque){
     (void)opaque;
@@ -172,9 +133,9 @@ static void broker_main(const struct hvf_options *options){
                 last_operation=operation;
                 // Sender has stopped guest TX before P; drain its finite IPC queue.
                 if(kind=='P'){
-                    for(;;){ssize_t bytes=recv(frames,packet,sizeof(packet),MSG_DONTWAIT);
+                    for(;;){int passed;ssize_t bytes=fd_recv_data(frames,packet,sizeof(packet),MSG_DONTWAIT,&passed);
                         if(bytes<0){if(errno==EINTR)continue;if(errno!=EAGAIN&&errno!=EWOULDBLOCK)goto done;break;}
-                        if(bytes<14||bytes>65536)goto done;
+                        if(passed||bytes<14||bytes>65536)goto done;
                         if(is_stream)stream_send(packet,(size_t)bytes);else slirp_backend_send(packet,(size_t)bytes);
                     }
                 }
@@ -186,13 +147,16 @@ static void broker_main(const struct hvf_options *options){
         relay_service();
         if(link_channel>=0){
             uint8_t kind;uint64_t generation;int descriptor;
-            while(link_receive(link_channel,&kind,&generation,&descriptor)){
+            int received;
+            while((received=link_receive(link_channel,&kind,&generation,&descriptor))>0){
                 if(descriptor>=0)close(descriptor);
                 if(generation!=offered||!direct)continue;
                 if(kind==LINK_ACK&&held>=0){close(held);held=-1;}
                 // The VMM closed a failed link: reconnect after the usual delay.
                 if(kind==LINK_LOST){direct=0;if(held>=0){close(held);held=-1;}stream.fd=-1;stream_disconnect();}
             }
+            // The VMM passed descriptors it never may: the channel is not trusted.
+            if(received<0){fprintf(stderr,"network broker: link channel passed unexpected descriptors\n");goto done;}
             // Hand each new connection to the VMM, at a frame boundary in both
             // directions (bytes the broker already holds cannot follow the
             // descriptor). A failed handoff leaves the link with the broker,
@@ -207,9 +171,10 @@ static void broker_main(const struct hvf_options *options){
         for(unsigned budget=0;budget<256;budget++){
             // While the VMM owns the link it sends nothing here; drain stragglers.
             if(is_stream && !direct && !stream_can_send())break;
-            ssize_t n=recv(frames,packet,sizeof(packet),MSG_DONTWAIT);
+            // Descriptors on the frame channel are a protocol violation, like a bad length.
+            int passed;ssize_t n=fd_recv_data(frames,packet,sizeof(packet),MSG_DONTWAIT,&passed);
             if(n<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)goto done;break;}
-            if(n<14||n>65536)goto done;
+            if(passed||n<14||n>65536)goto done;
             if(is_stream&&direct){stream.drops++;stream.drop_bytes+=(uint64_t)n;}
             else if(is_stream)stream_send(packet,(size_t)n);else slirp_backend_send(packet,(size_t)n);
         }
@@ -276,7 +241,11 @@ int net_backend_send(const void *data,size_t size){
 static void link_service(void){
     if(link_channel<0)return;
     uint8_t kind;uint64_t generation;int descriptor;
-    for(unsigned budget=0;budget<16&&link_receive(link_channel,&kind,&generation,&descriptor);budget++){
+    for(unsigned budget=0;budget<16;budget++){
+        int received=link_receive(link_channel,&kind,&generation,&descriptor);
+        if(!received)break;
+        // Only the broker writes here, one descriptor per offer at most.
+        if(received<0)fail("link channel passed unexpected descriptors");
         if(kind!=LINK_OFFER||descriptor<0||generation<=link_generation){if(descriptor>=0)close(descriptor);continue;}
         if(fcntl(descriptor,F_SETFD,FD_CLOEXEC)){close(descriptor);continue;}
         if(stream.fd>=0)close(stream.fd);
@@ -302,8 +271,9 @@ void net_backend_poll(void){
     }
     if(deferred_size){if(receive_frame(deferred_frame,deferred_size,NULL)<0)return;deferred_size=0;}
     for(unsigned budget=0;budget<256;budget++){
-        ssize_t n=recv(frames,packet,sizeof(packet),MSG_DONTWAIT);
+        int passed;ssize_t n=fd_recv_data(frames,packet,sizeof(packet),MSG_DONTWAIT,&passed);
         if(n<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)fail("broker receive failed");break;}
+        if(passed)fail("broker passed descriptors with a frame");
         if(n<14||n>65536)fail("invalid broker frame");
         if(receive_frame(packet,(size_t)n,NULL)<0){memcpy(deferred_frame,packet,(size_t)n);deferred_size=(size_t)n;break;}
     }
@@ -365,8 +335,8 @@ int net_backend_pending_rx(void){
 
 void net_backend_metrics(uint64_t out[7]){
     if(stats>=0)for(unsigned budget=0;budget<8;budget++){
-        uint8_t packet[49];ssize_t n=recv(stats,packet,sizeof(packet),MSG_DONTWAIT);if(n<0)break;
-        if(n!=48 || memcmp(packet,"HVDP\1\5\0\0",8))continue;
+        uint8_t packet[49];int passed;ssize_t n=fd_recv_data(stats,packet,sizeof(packet),MSG_DONTWAIT,&passed);if(n<0)break;
+        if(passed || n!=48 || memcmp(packet,"HVDP\1\5\0\0",8))continue;
         uint64_t values[5]={0};for(unsigned i=0;i<5;i++)for(unsigned j=0;j<8;j++)values[i]|=(uint64_t)packet[8+i*8+j]<<(8*j);
         rx_drops=values[0];rx_drop_bytes=values[1];stats_drops=values[2];stream_drops=values[3];stream_drop_bytes=values[4];
     }

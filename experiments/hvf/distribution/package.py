@@ -69,6 +69,8 @@ def main():
                        check=True, capture_output=True)
         unsigned[str(binary.relative_to(output))] = digest(binary)
     for binary in binaries:
+        # No hardened runtime here: with ad-hoc signatures (no Team ID) its library
+        # validation refuses every bundled dylib. sign-notarize.sh enables it.
         command = ['/usr/bin/codesign', '--force', '--sign', '-', '--timestamp=none']
         if binary == executable:
             command += ['--entitlements', str(ROOT / 'experiments/hvf/entitlements.plist')]

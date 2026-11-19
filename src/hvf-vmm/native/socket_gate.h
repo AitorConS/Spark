@@ -19,3 +19,8 @@ void hvf_gate_close(int fd);
 int hvf_gate_is_listener(int fd);
 
 int hvf_gate_check(void);
+// Seatbelt profile of the authority: network, and reading the interface list.
+#define HVF_GATE_PROFILE "(version 1)(deny default)(allow network*)(allow sysctl-read (sysctl-name \"net.routetable.0.0.3.0\"))"
+// Nonzero for an address of a local interface or on the IPv4 subnet of one,
+// and when the interface list cannot be read (fail closed).
+int hvf_gate_host_local(const struct in_addr *);

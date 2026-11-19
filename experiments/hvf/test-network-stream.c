@@ -5,12 +5,13 @@
 #include <stdlib.h>
 #include <sys/socket.h>
 static unsigned recv_calls;
-static ssize_t counted_recv(int fd,void *buffer,size_t size,int flags);
-#define recv counted_recv
+// The transport receives through fd_recv_data(), which calls recvmsg().
+static ssize_t counted_recvmsg(int fd,struct msghdr *message,int flags);
+#define recvmsg counted_recvmsg
 #include "net_backend_stream.h"
-#undef recv
-static ssize_t counted_recv(int fd,void *buffer,size_t size,int flags){
-    recv_calls++;return recv(fd,buffer,size,flags);
+#undef recvmsg
+static ssize_t counted_recvmsg(int fd,struct msghdr *message,int flags){
+    recv_calls++;return recvmsg(fd,message,flags);
 }
 static unsigned received;
 static int blocked;
