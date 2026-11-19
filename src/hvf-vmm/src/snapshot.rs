@@ -330,52 +330,88 @@ fn manifest(path: &Path) -> Result<Manifest> {
     Ok(manifest)
 }
 
-// A unix-stream connection is a host capability, not portable VM state.  Keep
-// the guest-visible device (interface ID and MAC) fixed, but require the
-// restoring supervisor to provide the current external-switch socket.  This
-// makes reconnects explicit and prevents a snapshot from selecting another
-// VM's link.  The substituted configuration is validated below, including the
-// matching security.unix_stream capability and the absence of IP policy.
-fn rebind_unix_stream(config: &mut Config, restore: &serde_json::Value) -> Result<()> {
-    let Some(saved) = config
-        .network_interfaces
-        .iter()
-        .find(|network| network.backend == "unix-stream")
-    else {
-        return Ok(());
-    };
-    let current: Vec<crate::Network> = serde_json::from_value(
-        restore
-            .get("network-interfaces")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
-    )
-    .map_err(|_| "unix-stream snapshot requires compatible restore networking")?;
-    if current.len() != 1
-        || current[0].backend != "unix-stream"
-        || current[0].iface_id != saved.iface_id
-        || current[0].guest_mac != saved.guest_mac
-    {
-        return Err("unix-stream snapshot restore interface is incompatible".into());
+/// One section of the restoring supervisor's configuration; absent or null is
+/// that section's default (for `security`, deny everything).
+fn section<T: serde::de::DeserializeOwned + Default>(
+    restore: &serde_json::Value,
+    name: &str,
+) -> Result<T> {
+    match restore.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(T::default()),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|e| format!("snapshot restore requires a valid current {name}: {e}").into()),
     }
-    let security: Option<crate::security::Security> = serde_json::from_value(
-        restore
-            .get("security")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
-    )
-    .map_err(|_| "unix-stream snapshot requires compatible restore security")?;
-    config.network_interfaces = current;
-    config.security = security;
+}
+// What the guest sees is restored from the snapshot: RAM, CPUs, devices and
+// the interface's ID, MAC and MTU. What the host grants it never is: the
+// security policy (Seatbelt mode, egress, listeners, DNS, Unix sockets),
+// forwarded host ports, resource limits and the `hvf` host options belong to
+// the restoring supervisor, as set by its configuration and PUT requests
+// before the load. A snapshot is a file anyone who can write it may edit, and
+// its hashes cover components, not the manifest's configuration: adopting its
+// `security.mode: development`, its forwards or its limits would let it turn
+// off the sandbox, publish host ports or raise its own ceilings.
+//
+// A unix-stream connection is a host capability too. The guest-visible
+// device (interface ID and MAC) stays fixed and the restoring supervisor must
+// declare a compatible interface with the current external-switch socket,
+// which makes reconnects explicit and prevents a snapshot from selecting
+// another VM's link. A slirp interface takes its forwards from a compatible
+// current interface, or none when the supervisor declares no interface. The
+// result is validated below, including that every forward is an authorized
+// listener of the current policy.
+/// Returns the sections in which the snapshot differed from the supervisor.
+fn rebind_host(config: &mut Config, restore: &serde_json::Value) -> Result<Vec<&'static str>> {
+    let security: crate::security::Security = section(restore, "security")?;
+    let limits: crate::limits::Limits = section(restore, "limits")?;
+    let hvf: crate::Options = section(restore, "hvf")?;
+    let current: Vec<crate::Network> = section(restore, "network-interfaces")?;
+    let mut overridden = Vec::new();
+    if let Some(saved) = config.network_interfaces.first_mut() {
+        let forwards = serde_json::to_value(&saved.forwards)?;
+        match current.as_slice() {
+            [] if saved.backend != "unix-stream" => saved.forwards.clear(),
+            [now]
+                if now.backend == saved.backend
+                    && now.iface_id == saved.iface_id
+                    && now.guest_mac == saved.guest_mac =>
+            {
+                saved.socket_path = now.socket_path.clone();
+                saved.forwards = now.forwards.clone();
+            }
+            _ => {
+                return Err(format!(
+                    "{} snapshot restore interface is incompatible: declare interface {} with MAC {} and the {} backend, or none",
+                    saved.backend, saved.iface_id, saved.guest_mac, saved.backend
+                )
+                .into());
+            }
+        }
+        if forwards != serde_json::to_value(&saved.forwards)? {
+            overridden.push("forwards");
+        }
+    }
+    if serde_json::to_value(&config.security)? != serde_json::to_value(Some(&security))? {
+        overridden.push("security");
+    }
+    if serde_json::to_value(&config.limits)? != serde_json::to_value(&limits)? {
+        overridden.push("limits");
+    }
+    if serde_json::to_value(&config.hvf)? != serde_json::to_value(&hvf)? {
+        overridden.push("hvf");
+    }
+    config.security = Some(security);
+    config.limits = limits;
+    config.hvf = hvf;
     config.validate_shape()?;
-    Ok(())
+    Ok(overridden)
 }
 
 /// Cheap synchronous compatibility check used by the API before accepting a
 /// restore. Integrity and component copying remain asynchronous.
-pub(crate) fn validate_restore_network(source: &Path, restore: &serde_json::Value) -> Result<()> {
+pub(crate) fn validate_restore(source: &Path, restore: &serde_json::Value) -> Result<()> {
     let mut config = manifest(source)?.config;
-    rebind_unix_stream(&mut config, restore)
+    rebind_host(&mut config, restore).map(|_| ())
 }
 /// Device and inode of an entry of `parent`, without following it.
 type Identity = (u64, u64);
@@ -558,7 +594,13 @@ pub(crate) fn materialize(
     if document.compatibility != compatibility()? {
         return Err("snapshot host, macOS, VMM build or device model is incompatible".into());
     }
-    rebind_unix_stream(&mut document.config, restore)?;
+    let overridden = rebind_host(&mut document.config, restore)?;
+    if !overridden.is_empty() {
+        eprintln!(
+            "HVF snapshot restore: {} taken from the restoring supervisor, not from the snapshot",
+            overridden.join(", ")
+        );
+    }
     for (name, limit) in names(&document.config) {
         let observed = copy_hash(
             &source.join(&name),
@@ -765,7 +807,7 @@ mod tests {
         let current =
             serde_json::to_value(stream_config("/private/tmp/new.sock", "02:00:00:00:00:01"))
                 .unwrap();
-        rebind_unix_stream(&mut saved, &current).unwrap();
+        rebind_host(&mut saved, &current).unwrap();
         assert_eq!(
             saved.network_interfaces[0].socket_path.as_deref(),
             Some(Path::new("/private/tmp/new.sock"))
@@ -780,7 +822,7 @@ mod tests {
             serde_json::to_value(stream_config("/private/tmp/new.sock", "02:00:00:00:00:02"))
                 .unwrap();
         assert!(
-            rebind_unix_stream(&mut saved, &incompatible)
+            rebind_host(&mut saved, &incompatible)
                 .unwrap_err()
                 .to_string()
                 .contains("interface is incompatible")
@@ -793,7 +835,7 @@ mod tests {
             "protocol":"tcp", "address":"192.0.2.10", "port":443
         }]);
         assert!(
-            rebind_unix_stream(
+            rebind_host(
                 &mut stream_config("/private/tmp/old.sock", "02:00:00:00:00:01"),
                 &policy,
             )
@@ -805,7 +847,7 @@ mod tests {
         let relative =
             serde_json::to_value(stream_config("relative.sock", "02:00:00:00:00:01")).unwrap();
         assert!(
-            rebind_unix_stream(
+            rebind_host(
                 &mut stream_config("/private/tmp/old.sock", "02:00:00:00:00:01"),
                 &relative,
             )
@@ -819,13 +861,121 @@ mod tests {
                 .unwrap();
         mismatch["security"]["unix_stream"] = serde_json::json!("/private/tmp/other.sock");
         assert!(
-            rebind_unix_stream(
+            rebind_host(
                 &mut stream_config("/private/tmp/old.sock", "02:00:00:00:00:01"),
                 &mismatch,
             )
             .unwrap_err()
             .to_string()
             .contains("matching security.unix_stream")
+        );
+    }
+
+    fn slirp_config(mac: &str) -> serde_json::Value {
+        serde_json::json!({
+            "boot-source": {"kernel_image_path":"/kernel"},
+            "network-interfaces": [{
+                "iface_id":"eth0", "guest_mac":mac, "backend":"slirp", "mtu":9000,
+                "forwards":[{"protocol":"tcp","host_addr":"127.0.0.1","host_port":19000,
+                             "guest_addr":"10.0.2.15","guest_port":9000}]
+            }],
+            "security": {"version":1, "listeners":[{"protocol":"tcp","address":"127.0.0.1","port":19000}]},
+            "limits": {"version":1, "disk_bytes_per_second":1048576},
+            "hvf": {"max_runtime_ms":60000}
+        })
+    }
+
+    #[test]
+    fn restore_takes_policy_forwards_limits_and_options_from_the_supervisor() {
+        // A manifest edited to leave the sandbox, publish more host ports and
+        // lift its own ceilings.
+        let mut hostile = slirp_config("02:00:00:00:00:01");
+        hostile["security"] = serde_json::json!({
+            "version":1, "mode":"development", "public_egress":true,
+            "egress":[{"protocol":"tcp","address":"192.168.1.1","port":22}],
+            "listeners":[{"protocol":"tcp","address":"0.0.0.0","port":22},
+                         {"protocol":"tcp","address":"127.0.0.1","port":19000}]
+        });
+        hostile["network-interfaces"][0]["forwards"]
+            .as_array_mut()
+            .unwrap()
+            .push(
+                serde_json::json!({"protocol":"tcp","host_addr":"0.0.0.0","host_port":22,
+                                     "guest_addr":"10.0.2.15","guest_port":22}),
+            );
+        hostile["limits"] = serde_json::json!({
+            "version":1, "open_files":1048576, "rss_mib":1048576, "cpu_seconds":31536000,
+            "nice":-20, "disk_bytes_per_second":1099511627776u64
+        });
+        hostile["hvf"] = serde_json::json!({"max_runtime_ms":0, "trace":true});
+        let saved = || serde_json::from_value::<Config>(hostile.clone()).unwrap();
+
+        // The restoring supervisor's own configuration wins, section by section.
+        let mut config = saved();
+        let current = slirp_config("02:00:00:00:00:01");
+        let overridden = rebind_host(&mut config, &current).unwrap();
+        assert_eq!(overridden, ["forwards", "security", "limits", "hvf"]);
+        let security = config.security.as_ref().unwrap();
+        assert_eq!(security.mode, crate::security::Mode::Hardened);
+        assert!(!security.public_egress && security.egress.is_empty());
+        assert_eq!(security.listeners.len(), 1);
+        let net = &config.network_interfaces[0];
+        assert_eq!(net.forwards.len(), 1);
+        assert_eq!(
+            (net.forwards[0].host_addr, net.forwards[0].host_port),
+            ("127.0.0.1".parse().unwrap(), 19000)
+        );
+        assert_eq!(net.mtu, Some(9000)); // guest-visible: the snapshot's
+        assert_eq!(config.limits.disk_bytes_per_second, 1 << 20);
+        assert_eq!(
+            (
+                config.limits.open_files,
+                config.limits.nice,
+                config.limits.rss_mib
+            ),
+            (1024, 5, None)
+        );
+        assert_eq!(
+            (config.hvf.max_runtime_ms, config.hvf.trace),
+            (60000, false)
+        );
+
+        // A fresh API supervisor (default deny-all policy and limits) that
+        // declares no interface restores the device with no forwards.
+        let mut config = saved();
+        let fresh = serde_json::json!({"drives":[], "security":crate::security::Security::default(),
+                                       "limits":crate::limits::Limits::default()});
+        rebind_host(&mut config, &fresh).unwrap();
+        let security = config.security.as_ref().unwrap();
+        assert_eq!(security.mode, crate::security::Mode::Hardened);
+        assert!(security.listeners.is_empty() && !security.public_egress);
+        assert!(config.network_interfaces[0].forwards.is_empty());
+        assert_eq!(config.limits.open_files, 1024);
+        assert!(!config.hvf.trace);
+
+        // An identical configuration overrides nothing.
+        let mut config: Config = serde_json::from_value(slirp_config("02:00:00:00:00:01")).unwrap();
+        assert!(
+            rebind_host(&mut config, &slirp_config("02:00:00:00:00:01"))
+                .unwrap()
+                .is_empty()
+        );
+
+        // Another guest MAC is another device: refused, not silently remapped.
+        assert!(
+            rebind_host(&mut saved(), &slirp_config("02:00:00:00:00:02"))
+                .unwrap_err()
+                .to_string()
+                .contains("interface is incompatible")
+        );
+        // A current forward must still be authorized by the current policy.
+        let mut unauthorized = slirp_config("02:00:00:00:00:01");
+        unauthorized["security"]["listeners"] = serde_json::json!([]);
+        assert!(
+            rebind_host(&mut saved(), &unauthorized)
+                .unwrap_err()
+                .to_string()
+                .contains("not authorized")
         );
     }
 }

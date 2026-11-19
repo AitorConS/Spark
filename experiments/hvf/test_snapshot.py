@@ -65,6 +65,28 @@ class SnapshotTests(unittest.TestCase):
         with (snapshot/'ram.bin').open('r+b') as ram:ram.seek(8192);byte=ram.read(1);ram.seek(8192);ram.write(bytes([byte[0]^1]))
         self.assertIn('integrity mismatch',self.load(snapshot,'Failed')['last_error']['fault_message'])
 
+    def test_restore_keeps_the_supervisor_policy_limits_and_options(self):
+        self.put('/machine-config',{'mem_size_mib':64});self.start();self.pause()
+        snapshot=self.work/'snapshot';self.capture(snapshot);self.stop()
+        # The manifest's configuration is not covered by the component hashes:
+        # whoever can write the snapshot can edit it. None of this may be adopted.
+        path=snapshot/'manifest.json';manifest=json.loads(path.read_text())
+        manifest['config']['security']={'version':1,'mode':'development'}
+        manifest['config']['limits']={'version':1,'open_files':4096,'nice':0,'cpu_seconds':31536000}
+        manifest['config']['hvf']={'max_runtime_ms':0,'trace':True}
+        path.write_text(json.dumps(manifest))
+        self.put('/limits',{'version':1,'open_files':2048})
+        self.load(snapshot)
+        config=api(self.sock,'GET','/vm/config')[1]
+        self.assertEqual(config['security']['mode'],'hardened')
+        self.assertFalse(config['security']['public_egress'])
+        self.assertEqual((config['limits']['open_files'],config['limits']['nice']),(2048,5))
+        self.assertFalse(config['hvf']['trace'])
+        self.assertEqual(api(self.sock,'GET','/capabilities')[1]['isolation'],'seatbelt-macos26')
+        self.assertIn('security, limits, hvf taken from the restoring supervisor',(self.work/'log').read_text())
+        self.assertEqual(api(self.sock,'PUT','/actions',{'action_type':'Resume'})[0],202)
+        self.wait_state('Running')
+
     def test_failed_capture_preserves_previous_snapshot_and_paused_vm(self):
         self.put('/machine-config',{'mem_size_mib':64});self.start();self.pause()
         snapshot=self.work/'snapshot';self.capture(snapshot);before=(snapshot/'manifest.json').read_bytes();self.stop()

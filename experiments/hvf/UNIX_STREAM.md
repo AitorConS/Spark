@@ -69,7 +69,10 @@ The client never creates, deletes, or replaces the server socket.
   Before restoring, configure a `unix-stream` interface with the same
   `iface_id` and MAC, a current socket, and its `security.unix_stream` authorization.
   Restoration validates that compatibility and reconnects to the authorized socket;
-  it never implicitly reuses the authority saved in the snapshot.
+  it never implicitly reuses the authority saved in the snapshot. The whole
+  security policy, the limits and the `hvf` options are also the restoring
+  supervisor's, never the snapshot's: put `/limits` before the load to keep the
+  limits the VM booted with.
   Slirp also reinitializes networking on restore.
 
 ### Switch capabilities

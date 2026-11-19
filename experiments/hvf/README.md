@@ -405,6 +405,22 @@ Restored disks are independent copies. The network backend restarts;
 applications must reconnect. For `unix-stream`, the current configuration
 must declare a compatible interface and the authorized switch socket;
 see [the restore contract](UNIX_STREAM.md).
+
+A snapshot restores what the guest sees, never what the host grants it. The
+security policy (including `mode`), the forwarded host ports, the `limits` and
+the `hvf` options come from the restoring supervisor's current configuration,
+as set by its configuration file and by `PUT /security`, `/network-interfaces`,
+`/limits` and `/hvf` before `/snapshot/load`; those saved in the manifest are
+ignored. The manifest is not covered by the component hashes, so this is what
+stops an edited snapshot from turning off Seatbelt, publishing host ports or
+raising its own limits. A supervisor that configured none of them restores with
+the defaults: deny-all policy, no forwards, default limits. The interface's ID,
+MAC and MTU stay the snapshot's; a declared interface with another ID, MAC or
+backend is refused, and a slirp interface restored without a declared one has
+no forwards. When a section differed, the supervisor logs which ones it took
+from its own configuration. Earlier builds adopted the snapshot's policy,
+forwards, limits and options for slirp snapshots, and its limits and options
+for `unix-stream` ones.
 Manifests with invalid format, paths or sizes are rejected with HTTP 400
 before accepting the operation; component integrity is checked
 during async restore. No application transactional consistency,
