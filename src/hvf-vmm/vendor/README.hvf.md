@@ -35,10 +35,16 @@ receives fixed-size requests via IPC and authorizes the **translated**
 IPv4/port/protocol destination before opening TCP or sending UDP. There are no exceptions for
 loopback, gateway, or LAN. DNS requires an explicit resolver. Listeners require
 its authorization; UDP only replies to an observed peer on a declared listener
-(for 60 seconds, maximum 32 peers per socket).
+(for 60 seconds, maximum 32 peers per socket). A UDP socket that is not a
+declared listener only receives from endpoints the guest has sent to (for 60
+seconds after the last datagram, maximum 32 per socket), whatever the policy
+would let the guest reach. `public_egress` excludes, in the authority, every
+address of a local interface, every address on the IPv4 subnet of one and the
+far end of a point-to-point one: the interface list is read again at most every
+second, and a failure to read it refuses the grant. Routes are not consulted.
 
-The authority is part of the trust base: its Seatbelt profile allows network,
-but denies files and execution. This is deliberate because Seatbelt on macOS 26
+The authority is part of the trust base: its Seatbelt profile allows network
+and reading the interface list (one `sysctl`), but denies files and execution. This is deliberate because Seatbelt on macOS 26
 does not support filters for arbitrary IPv4 literals. Exact authorization is
 implemented by `socket_gate.c`; the broker receives already-open connected TCP sockets/listeners
 and Unix proxies for UDP, never Internet UDP sockets. The authority

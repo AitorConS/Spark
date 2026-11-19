@@ -28,8 +28,9 @@ static struct sockaddr_in address(unsigned port){struct sockaddr_in a={.sin_len=
 int main(int argc,char **argv){
     unsigned stress=argc==2 && !strcmp(argv[1],"--udp-stress")?32:0;
     // Set up real host endpoints before applying the broker profile.
-    int tcp=socket(AF_INET,SOCK_STREAM,0),udp=socket(AF_INET,SOCK_DGRAM,0);
-    struct sockaddr_in t=address(0),u=address(0);socklen_t len=sizeof(t);
+    int tcp=socket(AF_INET,SOCK_STREAM,0),udp=socket(AF_INET,SOCK_DGRAM,0),stranger=socket(AF_INET,SOCK_DGRAM,0);
+    struct sockaddr_in t=address(0),u=address(0),o=address(0);socklen_t len=sizeof(t);
+    assert(!bind(stranger,(void *)&o,sizeof(o)));assert(!getsockname(stranger,(void *)&o,&len));len=sizeof(t);
     assert(!bind(tcp,(void *)&t,sizeof(t)));assert(!listen(tcp,4));assert(!getsockname(tcp,(void *)&t,&len));
     u.sin_addr.s_addr=htonl(INADDR_ANY);
     assert(!bind(udp,(void *)&u,sizeof(u)));assert(!getsockname(udp,(void *)&u,&len));
@@ -41,6 +42,9 @@ int main(int argc,char **argv){
         ready=(struct pollfd){udp,POLLIN,0};assert(poll(&ready,1,3000)==1);
         struct sockaddr_in peer;socklen_t length=sizeof(peer);assert(recvfrom(udp,&byte,1,0,(void *)&peer,&length)==1&&byte=='u');
         assert(sendto(udp,"r",1,0,(void *)&peer,length)==1);
+        // An endpoint the policy allows, but that the guest never sent to,
+        // must not reach the guest's ephemeral UDP socket.
+        assert(sendto(stranger,"o",1,0,(void *)&peer,length)==1);
         for(unsigned i=0;i<stress;i++){
             ready=(struct pollfd){udp,POLLIN,0};assert(poll(&ready,1,3000)==1);
             length=sizeof(peer);assert(recvfrom(udp,&byte,1,0,(void *)&peer,&length)==1&&byte=='b');
@@ -48,11 +52,12 @@ int main(int argc,char **argv){
         }
         ready=(struct pollfd){udp,POLLIN,0};assert(poll(&ready,1,200)==0);
         int status;assert(waitpid(child,&status,0)==child);assert(WIFEXITED(status)&&WEXITSTATUS(status)==0);
-        close(tcp);close(udp);puts("Seatbelt file/socket denial, exact TCP authorization and UDP roundtrip: PASS");return 0;
+        close(tcp);close(udp);close(stranger);puts("Seatbelt file/socket denial, exact TCP authorization and UDP roundtrip: PASS");return 0;
     }
-    close(tcp);close(udp);if(stress){close(0);assert(dup2(2,1)==1);}
-    struct hvf_endpoint rules[2]={{.port=ntohs(t.sin_port),.address={127,0,0,1}},{.udp=1,.port=ntohs(u.sin_port),.address={127,0,0,1}}};
-    struct hvf_security policy={.egress_count=2,.egress=rules};hvf_policy_set(&policy);
+    close(tcp);close(udp);close(stranger);if(stress){close(0);assert(dup2(2,1)==1);}
+    struct hvf_endpoint rules[3]={{.port=ntohs(t.sin_port),.address={127,0,0,1}},{.udp=1,.port=ntohs(u.sin_port),.address={127,0,0,1}},
+        {.udp=1,.port=ntohs(o.sin_port),.address={127,0,0,1}}};
+    struct hvf_security policy={.egress_count=3,.egress=rules};hvf_policy_set(&policy);
     assert(!hvf_gate_start());assert(!hvf_sandbox_install("(version 1)(deny default)"));
     assert(open("/etc/passwd",O_RDONLY)<0);
     pid_t executable;char *args[]={"/usr/bin/true",NULL};assert(posix_spawn(&executable,args[0],NULL,NULL,args,environ)!=0);
@@ -91,6 +96,7 @@ int main(int argc,char **argv){
     ready=(struct pollfd){proxy,POLLIN,0};assert(poll(&ready,1,1000)==1);
     // Existing host endpoint remains usable for receiving in the restricted helper.
     struct sockaddr_in peer;len=sizeof(peer);assert(hvf_policy_recvfrom(proxy,&byte,1,0,(void *)&peer,&len)==1&&byte=='r');
+    ready=(struct pollfd){proxy,POLLIN,0};assert(poll(&ready,1,300)==0);
     int many[32];
     for(unsigned i=0;i<stress;i++){
         many[i]=hvf_policy_socket(AF_INET,SOCK_DGRAM,0);assert(many[i]>=0);

@@ -46,8 +46,9 @@ pub(crate) struct Security {
     /// Grants TCP and UDP to every public IPv4 address, beside the exact
     /// `egress` rules: the Internet, but not this host's loopback nor private,
     /// shared, link-local or other special-purpose networks that are not
-    /// globally reachable (see `hvf_policy_public`). It names no resolver;
-    /// `dns` does.
+    /// globally reachable (see `hvf_policy_public`), nor the addresses of the
+    /// host's interfaces and their subnets (`hvf_gate_host_local`). It names
+    /// no resolver; `dns` does.
     #[serde(default)]
     pub public_egress: bool,
     #[serde(default)]

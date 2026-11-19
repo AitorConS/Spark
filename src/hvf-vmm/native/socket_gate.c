@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #define MAX_UDP 256
 #define MAX_FD 4096
 // A lost datagram is retryable, but a channel that only ever faults must not be
@@ -53,6 +55,44 @@ static int channel=-1;
 static pid_t authority_pid=-1;
 static uint32_t sequence;
 static uint64_t now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec;}
+// public_egress grants public addresses, and a public address can be this
+// host's own or on one of its links (a host on a public subnet). For that
+// grant the authority also refuses every address of a local interface, every
+// address on the IPv4 subnet of one, and the far end of a point-to-point one.
+// The list is read again at most every second, and on every check while
+// reading it fails, which then refuses (fail closed). Prefixes shorter than /8
+// (tunnels that report no mask) count as their address alone. Routes are not
+// consulted: a public network reached through a gateway is not on-link.
+#define MAX_LOCAL 256
+static struct {uint32_t address,mask;} locals[MAX_LOCAL];
+static unsigned nlocals;
+static uint64_t locals_read_ms;
+static int locals_valid;
+static uint32_t sockaddr_v4(const struct sockaddr *a){
+    struct sockaddr_in v4={0};if(a){size_t n=a->sa_len<sizeof(v4)?a->sa_len:sizeof(v4);memcpy(&v4,a,n);}
+    return v4.sin_addr.s_addr;
+}
+int hvf_gate_host_local(const struct in_addr *address){
+    struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);
+    uint64_t ms=(uint64_t)t.tv_sec*1000+(uint64_t)t.tv_nsec/1000000;
+    if(!locals_valid||ms-locals_read_ms>=1000){
+        struct ifaddrs *list;
+        if(getifaddrs(&list)){locals_valid=0;return 1;}
+        nlocals=0;
+        for(struct ifaddrs *i=list;i&&nlocals<MAX_LOCAL;i=i->ifa_next){
+            if(!i->ifa_addr||i->ifa_addr->sa_family!=AF_INET)continue;
+            uint32_t mask=sockaddr_v4(i->ifa_netmask);
+            if(ntohl(mask)<0xff000000U)mask=0xffffffffU;
+            locals[nlocals].address=sockaddr_v4(i->ifa_addr);locals[nlocals++].mask=mask;
+            if((i->ifa_flags&IFF_POINTOPOINT)&&i->ifa_dstaddr&&i->ifa_dstaddr->sa_family==AF_INET&&nlocals<MAX_LOCAL){
+                locals[nlocals].address=sockaddr_v4(i->ifa_dstaddr);locals[nlocals++].mask=0xffffffffU;
+            }
+        }
+        freeifaddrs(list);locals_valid=1;locals_read_ms=ms;
+    }
+    for(unsigned i=0;i<nlocals;i++)if(!((address->s_addr^locals[i].address)&locals[i].mask))return 1;
+    return 0;
+}
 static void nonblock(int fd){int flags=fcntl(fd,F_GETFL);if(flags>=0)(void)fcntl(fd,F_SETFL,flags|O_NONBLOCK);}
 static int same(const struct sockaddr_in *a,const struct sockaddr_in *b){return a->sin_addr.s_addr==b->sin_addr.s_addr&&a->sin_port==b->sin_port;}
 static int send_reply(int fd,const struct reply *reply,int descriptor){
@@ -120,6 +160,18 @@ respond:;
     else if(descriptor>=0)close(descriptor);
     return result;
 }
+// Remote endpoints of a UDP slot, for 60 seconds after the last datagram:
+// those the guest sent to, and on a declared listener those that sent to it.
+static int known(const struct udp *slot,const struct sockaddr_in *address){
+    for(unsigned i=0;i<32;i++)if(slot->peers[i].expires>now()&&same(&slot->peers[i].address,address))return 1;
+    return 0;
+}
+static void remember(struct udp *slot,const struct sockaddr_in *address){
+    struct peer *peer=NULL;
+    for(unsigned i=0;i<32&&!peer;i++)if(slot->peers[i].expires&&same(&slot->peers[i].address,address))peer=&slot->peers[i];
+    if(!peer)peer=&slot->peers[slot->next_peer++%32];
+    peer->address=*address;peer->expires=now()+60;
+}
 static void udp_poll(struct udp *slot,int outgoing,int incoming,unsigned *remaining){
     uint8_t bytes[65536];struct datagram header={.magic=UDP_MAGIC};
     if(outgoing)for(unsigned budget=0;budget<16 && *remaining;budget++,--*remaining){
@@ -128,18 +180,19 @@ static void udp_poll(struct udp *slot,int outgoing,int incoming,unsigned *remain
         ssize_t n=fd_recv_none(slot->ipc,iov,2,MSG_DONTWAIT,&flags,&passed);
         if(n<0)break;
         if(passed||n<(ssize_t)sizeof(header)||(flags&MSG_TRUNC)||header.magic!=UDP_MAGIC||header.address.sin_family!=AF_INET)continue;
-        int allowed=hvf_policy_allows(SOCK_DGRAM,&header.address,0);
-        if(!allowed)for(unsigned i=0;i<32;i++)if(slot->peers[i].expires>now()&&same(&slot->peers[i].address,&header.address)){allowed=1;break;}
-        if(allowed)(void)sendto(slot->net,bytes,n-sizeof(header),MSG_DONTWAIT,(const void *)&header.address,sizeof(header.address));
+        if(!hvf_policy_allows(SOCK_DGRAM,&header.address,0)&&!known(slot,&header.address))continue;
+        remember(slot,&header.address);
+        (void)sendto(slot->net,bytes,n-sizeof(header),MSG_DONTWAIT,(const void *)&header.address,sizeof(header.address));
     }
     if(incoming)for(unsigned budget=0;budget<16 && *remaining;budget++,--*remaining){
         socklen_t length=sizeof(header.address);ssize_t n=recvfrom(slot->net,bytes,65507,MSG_DONTWAIT,(void *)&header.address,&length);if(n<0)break;
         socklen_t local_length=sizeof(slot->local);getsockname(slot->net,(void *)&slot->local,&local_length);
-        // An ephemeral outbound bind is not a listener: only deliver datagrams
-        // from an explicitly authorized UDP egress/DNS endpoint. A declared
-        // listener keeps receiving from any peer and records it for replies.
-        if(hvf_policy_allows(SOCK_DGRAM,&slot->local,1)){struct peer *peer=&slot->peers[slot->next_peer++%32];peer->address=header.address;peer->expires=now()+60;}
-        else if(!hvf_policy_allows(SOCK_DGRAM,&header.address,0))continue;
+        // An ephemeral outbound bind is not a listener: it only receives from
+        // an endpoint the guest has sent to, so public_egress does not let any
+        // public host reach it. A declared listener keeps receiving from any
+        // peer and records it for replies.
+        if(hvf_policy_allows(SOCK_DGRAM,&slot->local,1))remember(slot,&header.address);
+        else if(!known(slot,&header.address))continue;
         struct iovec iov[2]={{&header,sizeof(header)},{bytes,(size_t)n}};struct msghdr message={.msg_iov=iov,.msg_iovlen=2};
         // A transient sendmsg failure on the proxy channel must not close the
         // slot; the datagram is lost and the protocol retransmits instead.
@@ -153,8 +206,10 @@ static void authority(int fd,pid_t parent){
     for(int candidate=0;candidate<maximum;candidate++)if(candidate!=fd&&candidate!=2&&candidate!=lease)close(candidate);
     for(unsigned i=0;i<MAX_UDP;i++)sockets[i].net=sockets[i].ipc=-1;
     // This tiny authority is the trusted network permission boundary. It has no
-    // libslirp callbacks, file access or ability to execute further processes.
-    if(hvf_sandbox_install("(version 1)(deny default)(allow network*)"))_exit(2);
+    // libslirp callbacks, file access or ability to execute further processes;
+    // beyond the network it may only read the interface list (hvf_gate_host_local).
+    hvf_policy_set_local(hvf_gate_host_local);
+    if(hvf_sandbox_install(HVF_GATE_PROFILE))_exit(2);
     struct reply ready={.magic=MAGIC};
     if(send_reply(fd,&ready,-1))_exit(2);
     uint32_t next_token=0;
