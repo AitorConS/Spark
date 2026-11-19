@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "net_peer.h"
 #include "peer_proto.h"
+#include "fd_recv.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -121,21 +122,24 @@ static void control(const struct peer_message *m,int fd){
     }
     if(fd>=0)close(fd);
 }
+// The broker never passes more than one descriptor per message: a channel
+// that carries more, or more than fit, is no longer trusted. Peers are
+// dropped and every frame takes the switch again; the VM keeps running.
+static void channel_fail(void){
+    fprintf(stderr,"network peers: control channel passed unexpected descriptors; direct links disabled\n");
+    drop_all();epoch=0;memset(self_ip,0,4);close(channel);channel=-1;
+}
 static void channel_poll(void){
     for(unsigned budget=0;channel>=0&&budget<64;budget++){
-        uint8_t wire[PEER_MESSAGE+1];char space[CMSG_SPACE(4*sizeof(int))];
+        uint8_t wire[PEER_MESSAGE+1];char space[FD_RECV_SPACE];
         struct iovec io={wire,sizeof(wire)};
         struct msghdr m={.msg_iov=&io,.msg_iovlen=1,.msg_control=space,.msg_controllen=sizeof(space)};
         ssize_t n=recvmsg(channel,&m,MSG_DONTWAIT);
         if(n<0)return;
-        int fd=-1,extra=0;
-        for(struct cmsghdr *c=CMSG_FIRSTHDR(&m);c;c=CMSG_NXTHDR(&m,c)){
-            if(c->cmsg_level!=SOL_SOCKET||c->cmsg_type!=SCM_RIGHTS)continue;
-            size_t count=(c->cmsg_len-CMSG_LEN(0))/sizeof(int);
-            for(size_t i=0;i<count;i++){int d;memcpy(&d,CMSG_DATA(c)+i*sizeof(int),sizeof(d));if(fd<0)fd=d;else{close(d);extra=1;}}
-        }
+        int fd;
+        if(fd_recv_collect(&m,&fd)>1||(m.msg_flags&MSG_CTRUNC)){if(fd>=0)close(fd);channel_fail();return;}
         struct peer_message message;
-        if(n!=PEER_MESSAGE||extra||(m.msg_flags&MSG_CTRUNC)||peer_decode(wire,&message)){if(fd>=0)close(fd);continue;}
+        if(n!=PEER_MESSAGE||peer_decode(wire,&message)){if(fd>=0)close(fd);continue;}
         control(&message,fd);
     }
 }

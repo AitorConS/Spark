@@ -40,52 +40,13 @@ static int broker_stream;
 // connects, and the VMM asks it for a new link when one fails. Each handoff
 // carries a generation; the broker keeps its reference until the VMM
 // acknowledges it, as XNU can collect a socket that is only in flight.
-#define LINK_MESSAGE 16
-enum {LINK_OFFER='S',LINK_ACK='A',LINK_LOST='R'};
+#include "net_link.h"
 static uint64_t link_generation;   // VMM: generation of the adopted link (0: none)
 static int link_lost;              // VMM: LINK_LOST sent for link_generation
 // VMM: polls that ended inside a frame. A switch whose socket buffer is smaller
 // than a frame (older jerboad: 8 KiB) leaves one there every time.
 static unsigned link_partial_polls;
 #define LINK_PARTIAL_POLLS 32
-static int link_message(int fd,uint8_t kind,uint64_t generation,int descriptor){
-    uint8_t wire[LINK_MESSAGE]={'H','V','L','K',kind};
-    for(unsigned i=0;i<8;i++)wire[8+i]=(uint8_t)(generation>>(8*i));
-    char space[CMSG_SPACE(sizeof(int))];
-    struct iovec io={wire,sizeof(wire)};
-    struct msghdr h={.msg_iov=&io,.msg_iovlen=1};
-    if(descriptor>=0){
-        memset(space,0,sizeof(space));h.msg_control=space;h.msg_controllen=sizeof(space);
-        struct cmsghdr *c=CMSG_FIRSTHDR(&h);c->cmsg_level=SOL_SOCKET;c->cmsg_type=SCM_RIGHTS;c->cmsg_len=CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(c),&descriptor,sizeof(descriptor));
-    }
-    return sendmsg(fd,&h,MSG_DONTWAIT)==(ssize_t)sizeof(wire)?0:-1;
-}
-// Returns 1 with a message (and *descriptor, or -1), 0 when none is queued.
-static int link_receive(int fd,uint8_t *kind,uint64_t *generation,int *descriptor){
-    // Bounded: a flood of invalid datagrams must not keep the device loop here.
-    for(unsigned budget=0;budget<64;budget++){
-        uint8_t wire[LINK_MESSAGE+1];char space[CMSG_SPACE(sizeof(int))];
-        struct iovec io={wire,sizeof(wire)};
-        struct msghdr h={.msg_iov=&io,.msg_iovlen=1,.msg_control=space,.msg_controllen=sizeof(space)};
-        ssize_t n=recvmsg(fd,&h,MSG_DONTWAIT);
-        if(n<0)return 0;
-        *descriptor=-1;
-        for(struct cmsghdr *c=CMSG_FIRSTHDR(&h);c;c=CMSG_NXTHDR(&h,c)){
-            if(c->cmsg_level!=SOL_SOCKET||c->cmsg_type!=SCM_RIGHTS)continue;
-            size_t count=(c->cmsg_len-CMSG_LEN(0))/sizeof(int);
-            for(size_t i=0;i<count;i++){
-                int received;memcpy(&received,CMSG_DATA(c)+i*sizeof(int),sizeof(received));
-                if(*descriptor<0)*descriptor=received;else close(received);
-            }
-        }
-        if(n!=LINK_MESSAGE||(h.msg_flags&MSG_CTRUNC)||memcmp(wire,"HVLK",4)){if(*descriptor>=0)close(*descriptor);continue;}
-        *kind=wire[4];*generation=0;
-        for(unsigned i=0;i<8;i++)*generation|=(uint64_t)wire[8+i]<<(8*i);
-        return 1;
-    }
-    return 0;
-}
 static void fail(const char *message){fprintf(stderr,"network IPC: %s\n",message);exit(2);}
 static ssize_t broker_deliver(const void *data,size_t size,void *opaque){
     (void)opaque;
@@ -186,13 +147,16 @@ static void broker_main(const struct hvf_options *options){
         relay_service();
         if(link_channel>=0){
             uint8_t kind;uint64_t generation;int descriptor;
-            while(link_receive(link_channel,&kind,&generation,&descriptor)){
+            int received;
+            while((received=link_receive(link_channel,&kind,&generation,&descriptor))>0){
                 if(descriptor>=0)close(descriptor);
                 if(generation!=offered||!direct)continue;
                 if(kind==LINK_ACK&&held>=0){close(held);held=-1;}
                 // The VMM closed a failed link: reconnect after the usual delay.
                 if(kind==LINK_LOST){direct=0;if(held>=0){close(held);held=-1;}stream.fd=-1;stream_disconnect();}
             }
+            // The VMM passed descriptors it never may: the channel is not trusted.
+            if(received<0){fprintf(stderr,"network broker: link channel passed unexpected descriptors\n");goto done;}
             // Hand each new connection to the VMM, at a frame boundary in both
             // directions (bytes the broker already holds cannot follow the
             // descriptor). A failed handoff leaves the link with the broker,
@@ -276,7 +240,11 @@ int net_backend_send(const void *data,size_t size){
 static void link_service(void){
     if(link_channel<0)return;
     uint8_t kind;uint64_t generation;int descriptor;
-    for(unsigned budget=0;budget<16&&link_receive(link_channel,&kind,&generation,&descriptor);budget++){
+    for(unsigned budget=0;budget<16;budget++){
+        int received=link_receive(link_channel,&kind,&generation,&descriptor);
+        if(!received)break;
+        // Only the broker writes here, one descriptor per offer at most.
+        if(received<0)fail("link channel passed unexpected descriptors");
         if(kind!=LINK_OFFER||descriptor<0||generation<=link_generation){if(descriptor>=0)close(descriptor);continue;}
         if(fcntl(descriptor,F_SETFD,FD_CLOEXEC)){close(descriptor);continue;}
         if(stream.fd>=0)close(stream.fd);

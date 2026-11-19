@@ -94,6 +94,8 @@ fn main() {
             "native/net_backend.h",
             "native/net_peer.h",
             "native/net_peer_relay.h",
+            "native/net_link.h",
+            "native/fd_recv.h",
             "native/peer_proto.h",
             "native/net_gso.h",
             "native/net_backend_stream.h",
