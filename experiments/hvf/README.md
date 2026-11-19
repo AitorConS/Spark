@@ -84,6 +84,15 @@ VMM capacity does not imply that any guest fits in 64 MiB.
 The Linux example is validated with 256 MiB. Output-only PL011 console, GICv3, PSCI,
 legacy VirtIO PCI and MMIO fw_cfg. No interactive input console is offered.
 
+The console is written to the VMM's stdout byte for byte, unfiltered. The
+guest's writes go into a 256 KiB buffer that the device loop empties without
+blocking, so a stdout nobody reads never stalls a vCPU, pause or the
+watchdog. While the buffer is full, newer console bytes are dropped; once
+stdout takes bytes again the VMM's log (stderr) gets one line `HVF: guest
+console dropped N bytes while its output was not read` (at most every five
+seconds). At exit the VMM waits up to one second for stdout to take what is
+left. If stdout fails (a closed pipe), further output is discarded.
+
 ## Generic configuration
 
 ```json

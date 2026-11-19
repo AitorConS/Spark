@@ -7,7 +7,9 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <poll.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -48,6 +50,59 @@ static uint64_t restore_started, restore_physical_delta;
 #define CHECK(expr) do { hv_return_t r = (expr); if (r != HV_SUCCESS) { \
     fprintf(stderr, "%s: 0x%x\n", #expr, r); exit(1); } } while (0)
 
+pthread_mutex_t io_lock=PTHREAD_MUTEX_INITIALIZER;  /* device I/O lock, shared with devices.c */
+// Guest console (PL011 TX), byte-exact. A vCPU appends to this ring under
+// io_lock and never writes stdout itself: a stdout nobody reads would block
+// it with the lock held, and with it the device loop, pause and the watchdog.
+// The device loop writes the ring out without the lock and without blocking.
+// When the ring is full, newer bytes are dropped and counted; once stdout takes
+// bytes again one line on stderr reports them (at most every CONSOLE_REPORT_S,
+// so a reader that keeps falling behind does not fill the log).
+#define CONSOLE_RING (256*1024)
+#define CONSOLE_REPORT_S 5
+static uint8_t console_ring[CONSOLE_RING];
+static size_t console_head,console_used;  // under io_lock
+static uint64_t console_dropped;          // under io_lock
+static int console_closed;                // stdout failed: output is discarded
+static void console_put(uint8_t byte){
+    if(console_closed)return;
+    if(console_used==CONSOLE_RING){console_dropped++;return;}
+    console_ring[(console_head+console_used)%CONSOLE_RING]=byte;console_used++;
+}
+// Called without io_lock. The bytes it writes are outside the region a vCPU
+// may write to (it only appends past console_used), so only the indexes need
+// the lock. A pipe that reports POLLOUT takes PIPE_BUF bytes without blocking.
+// wait_ms bounds how long to wait for stdout to accept bytes (0: not at all).
+static double seconds(void);
+static void console_drain(int wait_ms){
+    static double next_report;
+    for(unsigned round=0;round<128;round++){
+        pthread_mutex_lock(&io_lock);
+        size_t head=console_head,used=console_used;
+        pthread_mutex_unlock(&io_lock);
+        if(!used)return;
+        struct pollfd out={STDOUT_FILENO,POLLOUT,0};
+        int ready=poll(&out,1,wait_ms);
+        if(ready<0&&errno==EINTR)continue;
+        if(ready<=0)return;
+        size_t chunk=used<PIPE_BUF?used:PIPE_BUF;
+        if(chunk>CONSOLE_RING-head)chunk=CONSOLE_RING-head;
+        ssize_t n=(out.revents&POLLNVAL)?-1:write(STDOUT_FILENO,console_ring+head,chunk);
+        if(n<0&&(errno==EINTR||errno==EAGAIN))continue;
+        pthread_mutex_lock(&io_lock);
+        if(n<=0){
+            console_closed=1;console_used=0;console_dropped=0;
+            pthread_mutex_unlock(&io_lock);
+            fprintf(stderr,"HVF: guest console output closed; discarding further output\n");
+            return;
+        }
+        console_head=(console_head+(size_t)n)%CONSOLE_RING;console_used-=(size_t)n;
+        uint64_t dropped=0;
+        if(console_dropped&&seconds()>=next_report){dropped=console_dropped;console_dropped=0;next_report=seconds()+CONSOLE_REPORT_S;}
+        pthread_mutex_unlock(&io_lock);
+        if(dropped)fprintf(stderr,"HVF: guest console dropped %llu bytes while its output was not read\n",(unsigned long long)dropped);
+    }
+}
 static int mmio(uint64_t addr, unsigned size, int write, uint64_t *value) {
     // PL011 transmit console, register interface and level TX interrupt.
 
@@ -58,7 +113,7 @@ static int mmio(uint64_t addr, unsigned size, int write, uint64_t *value) {
     if(addr>=0x09000000 && addr<=0x09000048 && !(addr&3) && (size==1||size==2||size==4)){
         unsigned off=addr-0x09000000;
         if(write){
-            if(off==0){putchar(*value&255);fflush(stdout);}
+            if(off==0)console_put((uint8_t)*value);
             else uart[off/4]=*value;
             if(off==0x38 || off==0x44)CHECK(hv_gic_set_spi(33,(uart[0x38/4]&0x20)!=0));
         }else if(off==0x18)*value=0x90;
@@ -94,7 +149,6 @@ struct cpu {
 static struct cpu cpus[MAX_CPUS];
 static unsigned ncpus=1;
 static const struct hvf_options *options;
-pthread_mutex_t io_lock=PTHREAD_MUTEX_INITIALIZER;  /* device I/O lock, shared with devices.c */
 static pthread_mutex_t state_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t state_change=PTHREAD_COND_INITIALIZER;
 static atomic_int result=-1;
@@ -549,6 +603,7 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
             next_metrics=seconds()+0.1;
         }
         pthread_mutex_unlock(&io_lock);
+        console_drain(0);
         if(options->timeout_ms && seconds()>=deadline){fprintf(stderr,"HVF: watchdog deadline\n");finish(124);}
         // Guest TX notifications and broker RX are polled here. Keep the
         // network responsive during a burst without spinning while idle.
@@ -568,6 +623,15 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
     CHECK(hv_vcpus_exit(ids,ncpus));
     pthread_mutex_lock(&state_lock);teardown_released=1;pthread_cond_broadcast(&state_change);pthread_mutex_unlock(&state_lock);
     for(unsigned i=0;i<ncpus;i++)pthread_join(cpus[i].thread,NULL);
+    // The guest's last words (a panic, a shutdown message): a reader gets them,
+    // a stdout nobody reads delays the exit by a bounded wait at most.
+    for(double until=seconds()+1;seconds()<until;){
+        pthread_mutex_lock(&io_lock);size_t pending=console_used;pthread_mutex_unlock(&io_lock);
+        if(!pending)break;
+        console_drain(100);
+    }
+    // Every vCPU has stopped: the ring is this thread's alone.
+    if(console_dropped||console_used)fprintf(stderr,"HVF: guest console dropped %llu bytes while its output was not read\n",(unsigned long long)(console_dropped+console_used));
     CHECK(hv_vm_unmap(RAM_BASE,ram_size));CHECK(hv_vm_destroy());
     net_close();devices_close();munmap(ram,ram_size);
     if(metrics_fd>=0)close(metrics_fd);
