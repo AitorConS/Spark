@@ -1,19 +1,21 @@
-# Firecracker for macOS
+# Spark
 
-Run lightweight ARM64 virtual machines on Apple Silicon using Apple's
+Spark runs lightweight ARM64 virtual machines on Apple Silicon using Apple's
 Hypervisor.framework. Boot Linux or an ELF unikernel, attach disks, configure
 networking, and manage the VM through a local HTTP API.
 
-This is an independent, experimental fork of
-[Firecracker](https://github.com/firecracker-microvm/firecracker), not an official
-AWS release. The original Linux/KVM backend remains available.
+Spark is the VMM behind [Jerboa](https://jerboa.dev) on macOS, where every app
+runs in a VM of its own. It is an independent fork of
+[Firecracker](https://github.com/firecracker-microvm/firecracker), not an
+official AWS release: the executable is still called `firecracker`, and the
+original Linux/KVM backend remains available.
 
 ## What You Can Do
 
-- Boot ARM64 Linux Image/initramfs or ELF guests with 1-4 vCPUs and 64-2048 MiB RAM.
+- Boot ARM64 Linux Image/initramfs or ELF guests with 1-8 vCPUs and up to 8192 MiB of RAM.
 - Attach up to four file-backed VirtIO disks, with read-only and copy-on-start modes.
-- Use user-mode networking with explicit TCP/UDP forwarding, or connect an external
-  Ethernet switch over a Unix socket.
+- Use user-mode networking with explicit TCP/UDP forwarding and an MTU of up to
+  9000, or connect an external Ethernet switch over a Unix socket.
 - Start, stop, pause, resume, and inspect VMs through a private Unix-socket API.
 - Save and restore local snapshots, with explicit network reconnection.
 - Inspect JSON or Prometheus metrics and configure resource limits.
@@ -32,8 +34,8 @@ the Linux fixture builder. No QEMU or sibling project is required.
 ## Quick Start
 
 ```sh
-git clone https://github.com/AitorConS/firecracker-macos.git
-cd firecracker-macos
+git clone https://github.com/AitorConS/Spark.git
+cd Spark
 rustup toolchain install 1.97.0 --profile minimal --component clippy
 
 python3 experiments/hvf/distribution/build-native-deps.py
@@ -105,9 +107,11 @@ group-writable parent without it, which earlier builds accepted, now fails
 with `snapshot parent directory must be private or sticky`; see
 [`experiments/hvf/README.md`](experiments/hvf/README.md).
 
-This fork is intended for local development and experimentation. Public signed
-distribution, broader hardware qualification, a full 24-hour stability campaign,
-and physical power-loss certification remain outside the current validation.
+Spark ships inside Jerboa's macOS releases, built from a pinned commit of this
+repository. Builds are signed ad hoc; Developer ID signing and notarization are
+not in place yet. Broader hardware qualification, a full 24-hour stability
+campaign, and physical power-loss certification remain outside the current
+validation.
 
 ## Documentation
 
@@ -125,6 +129,6 @@ Bug reports and focused pull requests are welcome. Include your Mac model,
 macOS build, build revision, a minimal configuration, and reproduction steps;
 remove credentials and private guest data before sharing logs.
 
-This fork builds on the work of the Firecracker contributors. It retains the
+Spark builds on the work of the Firecracker contributors. It retains the
 [Apache-2.0 license](LICENSE), [NOTICE](NOTICE), and third-party license notices.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the inherited contribution guidelines.

@@ -43,7 +43,7 @@ durability of virtio-blk volumes. None of it is linked into release builds.
 ### Crash journal build
 
 ```sh
-F=$PWD   # firecracker-macos
+F=$PWD   # Spark checkout
 CFLAGS="-DHVF_CRASH_JOURNAL -I$F/experiments/hvf/durability" \
 CARGO_TARGET_DIR=/private/tmp/target-journal HVF_OUTPUT_DIR=/private/tmp/journal-vmm \
 sh experiments/hvf/build-native.sh

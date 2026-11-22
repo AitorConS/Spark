@@ -1,6 +1,6 @@
 # Generic macOS ARM64 VMM / Hypervisor.framework
 
-This local Firecracker fork runs ARM64 guests via HVF. The first
+Spark, this Firecracker fork, runs ARM64 guests via HVF. The first
 standalone milestone is implemented: ARM64 Linux with initramfs, VirtIO disk and networking,
 using exclusively the fork, generic tools and public
 Alpine artifacts. No other repositories are needed to build, configure or test
