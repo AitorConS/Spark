@@ -7,8 +7,7 @@ networking, and manage the VM through a local HTTP API.
 Spark is the VMM behind [Jerboa](https://jerboa.dev) on macOS, where every app
 runs in a VM of its own. It is an independent fork of
 [Firecracker](https://github.com/firecracker-microvm/firecracker), not an
-official AWS release: the executable is still called `firecracker`, and the
-original Linux/KVM backend remains available.
+official AWS release. The Linux/KVM backend it inherits remains available.
 
 ## What You Can Do
 
@@ -43,7 +42,7 @@ export GLIB_PREFIX="$PWD/experiments/hvf/build/distribution/native"
 sh experiments/hvf/build-native.sh
 
 python3 experiments/hvf/guests/linux/prepare.py
-build/macos-arm64/firecracker --no-api --config-file build/linux-guest/config.json
+build/macos-arm64/spark --no-api --config-file build/linux-guest/config.json
 ```
 
 The example boots Alpine Linux with a persistent test disk and a small HTTP/UDP
@@ -65,7 +64,7 @@ API server in a private directory:
 
 ```sh
 mkdir -m 700 vm-runtime
-build/macos-arm64/firecracker --api-sock "$PWD/vm-runtime/firecracker.sock"
+build/macos-arm64/spark --api-sock "$PWD/vm-runtime/spark.sock"
 ```
 
 See the [macOS guide](experiments/hvf/README.md) for complete configuration,

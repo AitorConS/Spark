@@ -3,7 +3,7 @@
 import fcntl,http.client,json,os,signal,socket,struct,subprocess,sys,tempfile,time,unittest
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
-BINARY=Path(os.environ.get('HVF_BINARY',ROOT/'build/macos-arm64/firecracker'))
+BINARY=Path(os.environ.get('HVF_BINARY',ROOT/'build/macos-arm64/spark'))
 def elf(words=None):
     words=words or [0xd503207f,0x17ffffff] # WFI; branch to WFI
     code=struct.pack('<'+'I'*len(words),*words);pa=0x40400000

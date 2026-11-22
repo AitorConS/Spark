@@ -1,31 +1,15 @@
 ---
 name: Feature request
-about: Suggest an idea for this project
+about: Suggest something Spark should do
 title: '[Feature Request] Title'
 labels: ''
 assignees: ''
 ---
 
-# Feature Request
+## What you want to do
 
-`[Author TODO: Why is this feature request important? What are the use cases? Please describe.]`
+The workload or use case, and what stops you today.
 
-## Describe the desired solution
+## What would help
 
-`[Author TODO: A clear and concise description of how you would like the feature to work.]`
-
-## Describe possible alternatives
-
-`[Author TODO: A clear and concise description of any alternative solutions or features you have considered.]`
-
-`[Author TODO: How do you work around not having this feature?]`
-
-## Additional context
-
-`[Author TODO: Add additional context about this feature request here.]`
-
-## Checks
-
-- [ ] Have you searched the Firecracker Issues database for similar requests?
-- [ ] Have you read all the existing relevant Firecracker documentation?
-- [ ] Have you read and understood Firecracker's core tenets?
+The behavior or option you have in mind, and any alternative you considered.

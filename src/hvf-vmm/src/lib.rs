@@ -608,12 +608,12 @@ fn entry(version: &str) -> Result<i32> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--version" => {
-                println!("Firecracker {} / experimental Darwin HVF backend", version);
+                println!("Spark {} (Firecracker fork, Darwin HVF backend)", version);
                 return Ok(0);
             }
             "--help" => {
                 println!(
-                    "firecracker --no-api --config-file CONFIG [--check-config]\nfirecracker --api-sock SOCKET [--config-file CONFIG]\nfirecracker --migrate-config --config-file CONFIG\nfirecracker --capabilities\nExperimental macOS ARM64 backend; see experiments/hvf/README.md"
+                    "spark --no-api --config-file CONFIG [--check-config]\nspark --api-sock SOCKET [--config-file CONFIG]\nspark --migrate-config --config-file CONFIG\nspark --capabilities\nSpark, the macOS ARM64 VMM; see experiments/hvf/README.md"
                 );
                 return Ok(0);
             }

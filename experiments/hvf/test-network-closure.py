@@ -11,7 +11,7 @@ def overlay(entries):
         layer.extend(b'070701'+''.join(f'{v:08x}' for v in fields).encode()+encoded);layer.extend(bytes(-len(layer)%4));layer.extend(data);layer.extend(bytes(-len(layer)%4))
     return gzip.compress(layer,mtime=0)
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--binary',type=Path,default=ROOT/'build/macos-arm64/firecracker');p.add_argument('--runs',type=int,default=5);p.add_argument('--count',type=int,default=64);p.add_argument('--workers',type=int,default=8);p.add_argument('--dns-count',type=int,default=16);p.add_argument('--small',action='store_true');p.add_argument('--keep-going',action='store_true');p.add_argument('--output',type=Path,default=ROOT/'experiments/hvf/build/astra-network-evidence/linux');a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--binary',type=Path,default=ROOT/'build/macos-arm64/spark');p.add_argument('--runs',type=int,default=5);p.add_argument('--count',type=int,default=64);p.add_argument('--workers',type=int,default=8);p.add_argument('--dns-count',type=int,default=16);p.add_argument('--small',action='store_true');p.add_argument('--keep-going',action='store_true');p.add_argument('--output',type=Path,default=ROOT/'experiments/hvf/build/astra-network-evidence/linux');a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
     received=[];queries=[];stop=threading.Event()
     # Instrument anomalies instead of dying on them: an unhandled exception in
     # the resolver thread silently disables DNS for every later run. A datagram

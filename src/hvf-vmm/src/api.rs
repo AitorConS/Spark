@@ -337,7 +337,7 @@ fn serve_inner(socket: &Path, initial: Option<Config>, headless: bool) -> Result
                 ("GET", "/") => Ok((
                     200,
                     Some(
-                        json!({"id":"anonymous-instance","state":state,"vmm_version":"1.0-hvf","app_name":"Firecracker","exit_code":exit_code,"operation_id":operation_id,"last_error":last_error,"shutdown_delivered":shutdown_delivered,"api_version":"1.0"}),
+                        json!({"id":"anonymous-instance","state":state,"vmm_version":"1.0-hvf","app_name":"Spark","exit_code":exit_code,"operation_id":operation_id,"last_error":last_error,"shutdown_delivered":shutdown_delivered,"api_version":"1.0"}),
                     ),
                     false,
                 )),

@@ -1,4 +1,4 @@
-name: Firecracker CI
+name: Spark CI
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: firecracker-ci-${{ github.workflow }}-${{ github.ref }}
+  group: spark-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

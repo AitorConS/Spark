@@ -11,7 +11,7 @@ certification via power cuts remain outside local validation.
 The Darwin target uses `src/hvf-vmm`: configuration, loaders and API in Rust;
 HVF, PCI/VirtIO and slirp transport in C. It remains a new experimental backend,
 not a complete abstraction of the upstream Linux VMM. The
-security, snapshot and Firecracker Linux API guarantees do not carry over automatically.
+security, snapshot and API guarantees of upstream Firecracker on Linux do not carry over automatically.
 
 ## Build and demonstrate the milestone
 
@@ -31,7 +31,7 @@ python3 experiments/hvf/distribution/build-native-deps.py
 GLIB_PREFIX="$PWD/experiments/hvf/build/distribution/native" experiments/hvf/build-native.sh
 python3 experiments/hvf/guests/linux/prepare.py
 python3 experiments/hvf/guests/debian/prepare.py
-build/macos-arm64/firecracker --no-api --config-file build/linux-guest/config.json
+build/macos-arm64/spark --no-api --config-file build/linux-guest/config.json
 ```
 
 In another terminal:
@@ -74,7 +74,7 @@ the lock; another PATH binary is not silently accepted.
 
 Both boot in EL1 with MMU off, masked interrupts, x0=DTB,
 x1=x2=x3=0. RAM at `0x40000000`; 1–8 CPUs and 64–8192 MiB of configurable RAM.
-`firecracker --capabilities` prints these bounds, the drive limit and whether
+`spark --capabilities` prints these bounds, the drive limit and whether
 direct VM-to-VM links are supported, as JSON, so a launcher need not hard-code them.
 A slirp interface takes an optional `mtu` (576 to 9000, 1500 when absent; the
 limit is `slirp_mtu_max` in the capabilities). The guest must be configured
@@ -155,7 +155,7 @@ The guest configures its own address and routes. There is no gVisor dependency.
 ## macOS API 1.0
 
 ```sh
-build/macos-arm64/firecracker --api-sock /private/path/vmm.sock
+build/macos-arm64/spark --api-sock /private/path/vmm.sock
 ```
 
 Unix socket 0600; use private directory. HTTP/1.1 with connection close, without
@@ -275,7 +275,7 @@ Reproducible network tests are described in
 Old configurations require explicit migration:
 
 ```sh
-build/macos-arm64/firecracker --migrate-config --config-file old.json > migration-report.json
+build/macos-arm64/spark --migrate-config --config-file old.json > migration-report.json
 ```
 
 The report shows `configuration` and `required_listener_permissions`. Review and

@@ -32,12 +32,12 @@ def digest(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--binary', type=Path, default=ROOT / 'build/macos-arm64/firecracker')
+    parser.add_argument('--binary', type=Path, default=ROOT / 'build/macos-arm64/spark')
     parser.add_argument('output', type=Path, help='New destination directory (must not exist)')
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    executable = output / 'bin/firecracker'
+    executable = output / 'bin/spark'
     executable.parent.mkdir()
     (output / 'lib').mkdir()
     shutil.copy2(args.binary, executable)

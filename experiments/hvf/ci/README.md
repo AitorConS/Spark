@@ -2,7 +2,7 @@
 
 ## Automatic Checks
 
-`firecracker-ci.yml` runs on every push and pull request, using GitHub's macOS 26
+`spark-ci.yml` runs on every push and pull request, using GitHub's macOS 26
 ARM64 runner. It installs the pinned Rust toolchain, builds checksum-pinned native
 dependencies, installs LLVM for ASan/UBSan/LeakSanitizer, and runs `hosted.sh`:
 

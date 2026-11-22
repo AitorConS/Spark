@@ -7,7 +7,7 @@ ROOT=Path(__file__).resolve().parents[4]
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--kernel',type=Path,required=True)
 p.add_argument('--disk',type=Path,required=True)
-p.add_argument('--binary',type=Path,default=ROOT/'build/macos-arm64/firecracker')
+p.add_argument('--binary',type=Path,default=ROOT/'build/macos-arm64/spark')
 p.add_argument('--cpus',type=int,default=1)
 p.add_argument('--port',type=int)
 p.add_argument('--env',action='append',default=[])
