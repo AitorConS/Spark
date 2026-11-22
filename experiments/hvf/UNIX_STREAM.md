@@ -103,7 +103,7 @@ export CARGO_TARGET_DIR="$PWD/experiments/hvf/build/my-network-cargo"
 export HVF_OUTPUT_DIR="$PWD/experiments/hvf/build/my-network-bin"
 export GLIB_PREFIX="$PWD/experiments/hvf/build/distribution/native"
 sh experiments/hvf/build-native.sh
-export HVF_BINARY="$HVF_OUTPUT_DIR/firecracker"
+export HVF_BINARY="$HVF_OUTPUT_DIR/spark"
 sh experiments/hvf/test-network-stream.sh
 python3 -m unittest discover -s experiments/hvf -p test_network_stream.py -v
 ```

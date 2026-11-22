@@ -20,8 +20,8 @@ for library in "$stage"/package/lib/*.dylib; do
     /usr/bin/codesign --force --options runtime --timestamp --sign "$APPLICATION_IDENTITY" "$library"
 done
 /usr/bin/codesign --force --options runtime --timestamp --sign "$APPLICATION_IDENTITY" \
-    --entitlements "$root/experiments/hvf/entitlements.plist" "$stage/package/bin/firecracker"
-/usr/bin/codesign --verify --strict "$stage/package/bin/firecracker"
+    --entitlements "$root/experiments/hvf/entitlements.plist" "$stage/package/bin/spark"
+/usr/bin/codesign --verify --strict "$stage/package/bin/spark"
 # Signing changes file hashes. Keep build provenance and regenerate final checksums.
 /usr/bin/python3 - "$stage/package" <<'PY'
 import hashlib,json,sys
@@ -34,8 +34,8 @@ p.write_text(json.dumps(manifest,indent=2)+'\n')
     hashlib.sha256(p.read_bytes()).hexdigest()+'  '+str(p.relative_to(root))+'\n'
     for p in sorted(root.rglob('*')) if p.is_file() and p.name!='SHA256SUMS'))
 PY
-/usr/bin/pkgbuild --root "$stage/package" --identifier org.firecracker.hvf.experimental \
-    --version 1.0.0 --install-location /usr/local/libexec/firecracker-hvf \
+/usr/bin/pkgbuild --root "$stage/package" --identifier dev.jerboa.spark \
+    --version 1.0.0 --install-location /usr/local/libexec/spark \
     --sign "$INSTALLER_IDENTITY" "$output"
 /usr/bin/xcrun notarytool submit "$output" --keychain-profile "$NOTARY_PROFILE" --wait
 /usr/bin/xcrun stapler staple "$output"

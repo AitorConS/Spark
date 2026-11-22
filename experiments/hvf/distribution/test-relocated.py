@@ -57,13 +57,13 @@ def main():
         profile.write_text('(version 1)\n(allow default)\n' + ''.join(
             f'(deny file-read* file-write* (subpath {json.dumps(str(path))}))\n'
             for path in (ROOT, Path('/opt/homebrew'), Path('/usr/local'))))
-        wrapper = work / 'firecracker'
+        wrapper = work / 'spark'
         # Paths contain no user-provided shell text.
         import shlex
         wrapper.write_text('#!/bin/sh\nexec /usr/bin/sandbox-exec -f ' + shlex.quote(str(profile))
-                           + ' ' + shlex.quote(str(package / 'bin/firecracker')) + ' "$@"\n')
+                           + ' ' + shlex.quote(str(package / 'bin/spark')) + ' "$@"\n')
         wrapper.chmod(0o700)
-        env = {**os.environ, 'HVF_BINARY': str(package / 'bin/firecracker'), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
+        env = {**os.environ, 'HVF_BINARY': str(package / 'bin/spark'), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
         for key in list(env):
             if key.startswith('DYLD_'):
                 env.pop(key)

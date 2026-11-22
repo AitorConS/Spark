@@ -5,10 +5,10 @@ The final 24-hour test, other Macs, and publicly signed distribution
 are not certified. See the [available tests](../ci/README.md).
 
 Requires macOS 26 and Apple Silicon with Hypervisor available. The
-`bin/firecracker` executable uses the libraries in `lib/` relative to its location.
+`bin/spark` executable uses the libraries in `lib/` relative to its location.
 Keep both folders together. Does not require Homebrew to run.
 
-`bin/firecracker --api-sock /private/path/vmm.sock` starts the supervisor.
+`bin/spark --api-sock /private/path/vmm.sock` starts the supervisor.
 Guests and disks are provided by the user. The configuration requires
 `security: {"version": 1}` and denies networking by default; IPv4/port/protocol authorizations
 must be declared explicitly. The macOS 1.0 API includes
@@ -60,7 +60,7 @@ submits it to Apple and requests stapling. Requires APPLICATION_IDENTITY,
 INSTALLER_IDENTITY and NOTARY_PROFILE already configured. It does not run as part
 of the local build, requires credentials and performs an external transmission.
 It has not yet been validated with commercial identities. The package would install
-to /usr/local/libexec/firecracker-hvf; the local build installs nothing there.
+to /usr/local/libexec/spark; the local build installs nothing there.
 
 For a functional review limited to packaging, run
 `test-relocated.py PACKAGE --packaging-only`. This option selects explicit

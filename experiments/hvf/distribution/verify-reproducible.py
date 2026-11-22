@@ -34,7 +34,7 @@ def main():
     manifests = []
     for iteration in (1, 2):
         target = work / f'target-{iteration}'
-        env['RUSTFLAGS'] = f'-Ccodegen-units=1 --remap-path-prefix={target}=/build --remap-path-prefix={ROOT}=/firecracker'
+        env['RUSTFLAGS'] = f'-Ccodegen-units=1 --remap-path-prefix={target}=/build --remap-path-prefix={ROOT}=/spark'
         if not args.reuse_native:
             run(['meson', 'compile', '-C', BASE / 'glib-build', '--clean'], env)
             run(['meson', 'compile', '-C', BASE / 'glib-build', '-j', '4'], env)
